@@ -1,0 +1,32 @@
+[Unit]
+# BF7: демон тепловых алгоритмов MediaTek (thermalloadalgod из /vendor).
+#
+# Политика, которую прописывает bf7-thermal, включает CATM+ — алгоритм
+# теплового бюджета процессора. Считает его не ядро, а этот демон: ядро на
+# каждом замере платы и батареи шлёт ему по netlink (протокол 27) данные и
+# ждёт ответа, сам демон грузит /vendor/lib/libthermalalgo.so. Без демона
+# (так было 2026-09-23 с 11:45 до 13:00) ядро ~24 раза в минуту писало
+# «wakeup_ta_algo error, g_tad_pid=0» и «out of memory», а алгоритм не
+# работал вовсе. На Android он в class main, пользователь system.
+#
+# Песочница перед первым запуском (strace, 25 с): файлов не открывает,
+# кроме библиотек, пишет только в netlink; частоты процессора не тронуты.
+Description=Тепловые алгоритмы MediaTek (thermalloadalgod из /vendor)
+After=bf7-thermal.service
+Requires=bf7-android-mounts.service
+After=bf7-android-mounts.service
+ConditionPathExists=/vendor/bin/thermalloadalgod
+
+[Service]
+ExecStart=/vendor/bin/thermalloadalgod
+# Бионик-линкер при старте ворчит про /linkerconfig — это не ошибка.
+StandardError=null
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

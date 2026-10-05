@@ -1,0 +1,59 @@
+From 4143fdee7c922ddd306b9fa7d71e4a3ea607435e Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 01:10:01 +0300
+Subject: [PATCH 13/40] =?UTF-8?q?mtkfb:=20=D0=BD=D0=B5=20=D0=BF=D0=B5?=
+ =?UTF-8?q?=D1=80=D0=B5=D0=BA=D0=BB=D1=8E=D1=87=D0=B0=D1=82=D1=8C=20=D0=B2?=
+ =?UTF-8?q?=D0=B8=D1=80=D1=82=D1=83=D0=B0=D0=BB=D1=8C=D0=BD=D1=8B=D0=B9=20?=
+ =?UTF-8?q?=D1=82=D0=B5=D1=80=D0=BC=D0=B8=D0=BD=D0=B0=D0=BB=20=D0=BF=D0=B5?=
+ =?UTF-8?q?=D1=80=D0=B5=D0=B4=20=D1=81=D0=BD=D0=BE=D0=BC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+fbmem регистрирует каждый буфер кадра через
+pm_vt_switch_required(dev, !skip_vt_switch). Пока mtkfb требовал
+переключения, ядро перед сном переводило терминал на свою консоль и
+ждало, когда текущий отпустят, а им владеет композитор (libseat builtin,
+VT_PROCESS) — первая проба сна застряла в vt_waitactive.
+
+Экраном заведует композитор через bf7-disp, консоль приглушена —
+объявляем, как обычный DRM через fb_helper, что переключение не нужно.
+Параметр no_console_suspend здесь не помог бы: в pm_vt_switch() он,
+наоборот, заставляет переключать всегда.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../misc/mediatek/video/mt6765/videox/mtkfb.c   | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+index 8b1ef35f0..9ffaa1bf0 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+@@ -2661,6 +2661,23 @@ static int mtkfb_probe(struct platform_device *pdev)
+ 	}
+ 	init_state++;		/* 5 */
+ 	DISPMSG("register_framebuffer start...\n");
++	/*
++	 * BF7: не переключать виртуальный терминал перед сном.
++	 *
++	 * fbmem регистрирует каждый буфер кадра через
++	 * pm_vt_switch_required(dev, !skip_vt_switch), и пока хоть один требует
++	 * переключения, ядро перед сном переводит терминал на свою консоль и
++	 * ждёт, когда текущий отпустят. Текущим владеет композитор (libseat в
++	 * режиме builtin держит его в VT_PROCESS) и не отпускает — первая проба
++	 * сна 2026-09-23 застряла ровно в vt_waitactive из pm_prepare_console.
++	 *
++	 * Экраном у нас заведует композитор через bf7-disp, консоль на этом
++	 * буфере приглушена, так что переключаться незачем — как и обычный
++	 * DRM через fb_helper, объявляем, что переключение не нужно.
++	 * Внимание: параметр ядра no_console_suspend здесь НЕ помогает, а
++	 * наоборот — в pm_vt_switch() он заставляет переключать всегда.
++	 */
++	fbi->skip_vt_switch = true;
+ 	r = register_framebuffer(fbi);
+ 	if (r != 0) {
+ 		DISPERR("register_framebuffer failed\n");
+-- 
+2.55.0
+

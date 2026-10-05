@@ -1,0 +1,15 @@
+[Unit]
+Description=Приём сообщений liblog от андроидных библиотек
+Before=bf7-phosh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/minilogd.py
+Restart=on-failure
+RestartSec=3
+# Файл журнала minilogd ведёт сам, с ротацией (см. minilogd.py).
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

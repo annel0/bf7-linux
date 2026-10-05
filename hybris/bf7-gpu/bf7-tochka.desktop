@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Точка доступа
+Name[en]=Hotspot
+Comment=Раздать интернет по Wi-Fi (сеть BF7)
+Exec=/usr/local/bin/bf7-tochka
+Icon=network-wireless-hotspot-symbolic
+Terminal=false
+Categories=Network;Settings;
+StartupNotify=false
+X-Purism-FormFactor=Workstation;Mobile;

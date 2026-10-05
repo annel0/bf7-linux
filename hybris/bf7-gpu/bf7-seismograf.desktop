@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Сейсмограф
+Comment=Как дрожал стол, пока телефон лежал: график за последнюю ночь
+Exec=/usr/local/bin/bf7-seismograf-grafik --otkryt
+Icon=bf7-seismograf
+Categories=Utility;Science;
+Terminal=false
+X-Purism-FormFactor=Workstation;Mobile;

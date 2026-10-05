@@ -1,0 +1,18 @@
+[Unit]
+# BF7: разделы NVRAM модема (IMEI, калибровка, данные сети) — см. скрипт.
+Description=Разделы NVRAM модема (/mnt/vendor)
+After=local-fs.target
+ConditionPathExists=/dev/disk/by-partlabel/nvdata
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bf7-modem-mounts
+# У oneshot systemd таймаут по умолчанию отключает. e2fsck -p на разделах
+# NVRAM (десятки МБ) идёт секунды; если повиснет — пусть служба упадёт, а не
+# держит загрузку до бесконечности (цепочка модема тогда не стартует, но
+# телефон грузится).
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

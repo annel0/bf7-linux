@@ -1,0 +1,164 @@
+From 3786a94dc07d45c0e6da4c98b865517c81ddc940 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 11:19:08 +0300
+Subject: [PATCH 21/40] =?UTF-8?q?rtnl-=D1=81=D0=BB=D0=B5=D0=B6=D0=BA=D0=B0?=
+ =?UTF-8?q?=20=D0=B1=D0=B5=D0=B7=20=D0=BB=D0=B8=D1=88=D0=BD=D0=B5=D0=B3?=
+ =?UTF-8?q?=D0=BE=20=D1=82=D0=B0=D0=B9=D0=BC=D0=B5=D1=80=D0=B0;=20=D1=82?=
+ =?UTF-8?q?=D0=B8=D1=88=D0=B5=20=D1=81=D1=82=D0=BE=D1=80=D0=BE=D0=B6,=20au?=
+ =?UTF-8?q?xadc,=20PBM,=20DLPT;=20=D1=84=D0=BE=D1=80=D0=BC=D0=B0=D1=82=20?=
+ =?UTF-8?q?=D0=B2=20PBM?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- rtnetlink.c (отладка MediaTek): после КАЖДОГО rtnl_lock() таймер
+  срабатывал через 2 с и печатал «There is no process hold rtnl lock» —
+  лишнее пробуждение и ~10 строк в минуту. Таймер снимается при
+  отпускании (до mutex_unlock, чтобы не снять таймер следующего
+  владельца); предупреждения «держат >2 с/>4 с» остаются.
+- mtk_wdt.c: «[wdtk] kick watchdog» на каждый пинок — pr_debug.
+- mt635x-auxadc.c: убран __ratelimit вокруг dev_dbg — он сам печатал
+  «N callbacks suppressed».
+- mtk_pbm.c: «[ma_to_mw] …» — pr_debug; и ошибка формата: у
+  «[%s] wrong volt=%d» был один аргумент — при нулевом напряжении printk
+  принял бы число за указатель на строку.
+- mtk_dynamic_loading_throttling.c: «[DLPT_final] …» — pr_debug.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/iio/adc/mt635x-auxadc.c                   | 13 ++++++-------
+ drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c |  6 ++++--
+ .../mtk_dynamic_loading_throttling.c              |  2 +-
+ drivers/watchdog/mtk_wdt.c                        |  3 ++-
+ net/core/rtnetlink.c                              | 15 +++++++++++----
+ 5 files changed, 24 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/iio/adc/mt635x-auxadc.c b/drivers/iio/adc/mt635x-auxadc.c
+index 938199210..5f5786964 100644
+--- a/drivers/iio/adc/mt635x-auxadc.c
++++ b/drivers/iio/adc/mt635x-auxadc.c
+@@ -826,7 +826,6 @@ static int mt635x_auxadc_read_raw(struct iio_dev *indio_dev,
+ 	const struct auxadc_channels *auxadc_chan;
+ 	int auxadc_out = 0;
+ 	int ret;
+-	static DEFINE_RATELIMIT_STATE(ratelimit, 1 * HZ, 5);
+ 
+ 	mutex_lock(&adc_dev->lock);
+ 	pm_stay_awake(adc_dev->dev);
+@@ -883,12 +882,12 @@ static int mt635x_auxadc_read_raw(struct iio_dev *indio_dev,
+ 	 * строк в минуту про один и тот же VBIF. Оставлено на dev_dbg: при
+ 	 * нужде включается динамической отладкой, не пересобирая ядро.
+ 	 */
+-	if (__ratelimit(&ratelimit)) {
+-		dev_dbg(adc_dev->dev,
+-			"name:%s, channel=%d, adc_out=0x%x, adc_result=%d\n",
+-			auxadc_chan->ch_name, auxadc_chan->ch_num,
+-			auxadc_out, *val);
+-	}
++	/* BF7: без __ratelimit — он сам печатал «N callbacks suppressed»,
++	 * хотя dev_dbg выключена и подавлять было нечего. */
++	dev_dbg(adc_dev->dev,
++		"name:%s, channel=%d, adc_out=0x%x, adc_result=%d\n",
++		auxadc_chan->ch_name, auxadc_chan->ch_num,
++		auxadc_out, *val);
+ err:
+ 	return ret;
+ }
+diff --git a/drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c b/drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c
+index 0a7392a40..b8333341a 100644
+--- a/drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c
++++ b/drivers/misc/mediatek/base/power/pbm_v4/mtk_pbm.c
+@@ -191,13 +191,15 @@ unsigned int ma_to_mw(unsigned int val)
+ 
+ 	bat_vol = get_battery_volt();	/* return mV */
+ 	if (bat_vol <= 0) {
++		/* BF7: у формата %s и %d, а аргумент был один — при нулевом
++		 * напряжении printk принял бы число за указатель на строку. */
+ 		pr_notice_ratelimited("[%s] wrong volt=%d, set 4V\n",
+-			bat_vol);
++			__func__, bat_vol);
+ 		bat_vol = 4000;
+ 	}
+ 
+ 	ret_val = (bat_vol * val) / 1000;	/* mW = (mV * mA)/1000 */
+-	pr_info("[%s] %d(mV) * %d(mA) = %d(mW)\n",
++	pr_debug("[%s] %d(mV) * %d(mA) = %d(mW)\n", /* BF7: было pr_info */
+ 		__func__, bat_vol, val, ret_val);
+ 
+ 	return ret_val;
+diff --git a/drivers/misc/mediatek/power_throttling/mtk_dynamic_loading_throttling.c b/drivers/misc/mediatek/power_throttling/mtk_dynamic_loading_throttling.c
+index 65e7952ad..83006430c 100644
+--- a/drivers/misc/mediatek/power_throttling/mtk_dynamic_loading_throttling.c
++++ b/drivers/misc/mediatek/power_throttling/mtk_dynamic_loading_throttling.c
+@@ -376,7 +376,7 @@ static int dlpt_notify_handler(void *unused)
+ 				dlpt.imix = IMAX_MAX_VALUE;
+ 			exec_dlpt_callback(dlpt.imix);
+ 
+-			pr_info("[DLPT_final] %d,%d,%d,%d\n"
++			pr_debug("[DLPT_final] %d,%d,%d,%d\n" /* BF7: было pr_info */
+ 				, dlpt.imix, pre_ui_soc
+ 				, cur_ui_soc, IMAX_MAX_VALUE);
+ 		}
+diff --git a/drivers/watchdog/mtk_wdt.c b/drivers/watchdog/mtk_wdt.c
+index 15566bfdf..a170fd4b7 100644
+--- a/drivers/watchdog/mtk_wdt.c
++++ b/drivers/watchdog/mtk_wdt.c
+@@ -230,7 +230,8 @@ static int mtk_wdt_ping(struct watchdog_device *wdt_dev)
+ 	void __iomem *wdt_base = mtk_wdt->wdt_base;
+ 
+ 	iowrite32(WDT_RST_RELOAD, wdt_base + WDT_RST);
+-	pr_info("[wdtk] kick watchdog\n");
++	/* BF7: было pr_info — строка в журнал на каждый пинок (раз в ~16 с). */
++	pr_debug("[wdtk] kick watchdog\n");
+ 
+ 	return 0;
+ }
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index ddd0b8c8d..4a5c46a18 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -130,14 +130,20 @@ static void rtnl_print_btrace(struct timer_list *unused)
+ 		print_stack_trace(&show_trace, 0);
+ 		show_stack(rtnl_instance.task, NULL);
+ 		pr_info("------------%s end-----------\n", __func__);
+-	} else {
+-		pr_info("[mtk_net][rtnl_lock]There is no process hold rtnl lock\n");
+ 	}
++	/*
++	 * BF7: здесь была строка «There is no process hold rtnl lock» — таймер
++	 * срабатывал через 2 с после КАЖДОГО rtnl_lock(), даже давно отпущенного:
++	 * лишнее пробуждение процессора и ~10 строк в минуту в журнал. Теперь
++	 * таймер снимается при отпускании (rtnl_relase_btrace), и сюда попадаем
++	 * лишь когда замок действительно держат дольше 2 с.
++	 */
+ }
+ 
+ void rtnl_relase_btrace(void)
+ {
+ 	rtnl_instance.flag = 0;
++	del_timer(&rtnl_chk_timer);
+ }
+ 
+ struct rtnl_link {
+@@ -185,6 +191,9 @@ void __rtnl_unlock(void)
+ 			rtnl_instance.pid,
+ 			rtnl_instance.start, rtnl_instance.end);
+ 
++	/* BF7: снять слежку ДО отпускания — иначе можно снять таймер уже
++	 * следующего владельца замка. */
++	rtnl_relase_btrace();
+ 	mutex_unlock(&rtnl_mutex);
+ 
+ 	while (head) {
+@@ -194,8 +203,6 @@ void __rtnl_unlock(void)
+ 		cond_resched();
+ 		head = next;
+ 	}
+-
+-	rtnl_relase_btrace();
+ }
+ 
+ void rtnl_unlock(void)
+-- 
+2.55.0
+

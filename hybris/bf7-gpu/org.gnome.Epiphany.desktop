@@ -1,0 +1,21 @@
+[Desktop Entry]
+# Подмена родной записи Epiphany. Кладётся в /usr/local/share/applications,
+# а он идёт в XDG_DATA_DIRS раньше /usr/share, поэтому перекрывает её.
+#
+# Зачем. В сетке приложений было два «Веб-браузера»: наш bf7-web и родной
+# Epiphany под русским именем. Хуже того, ссылка, открытая из другого
+# приложения, попадала в родную запись — без снятой песочницы WebKit, и
+# браузер падал по кругу.
+#
+# Из сетки прячем (NoDisplay), но обработчиком ссылок оставляем и ведём на
+# bf7-web, чтобы окружение было правильным откуда бы ни открыли.
+Type=Application
+Name=Web
+Name[ru]=Веб-браузер (родная запись)
+Exec=/usr/local/bin/bf7-web %U
+Icon=org.gnome.Epiphany
+Terminal=false
+NoDisplay=true
+StartupNotify=true
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+Categories=Network;WebBrowser;

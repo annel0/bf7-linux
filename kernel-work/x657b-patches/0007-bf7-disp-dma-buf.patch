@@ -1,0 +1,648 @@
+From b39781557c5d9e92f9c5fdc1bfd992dba7fc6748 Mon Sep 17 00:00:00 2001
+From: bf7 <bf7@local>
+Date: Wed, 16 Sep 2026 17:34:02 +0300
+Subject: [PATCH 07/40] =?UTF-8?q?bf7-disp:=20=D0=BF=D0=BE=D0=BA=D0=B0?=
+ =?UTF-8?q?=D0=B7=20=D1=87=D1=83=D0=B6=D0=B8=D1=85=20dma-buf=20=D0=B1?=
+ =?UTF-8?q?=D0=B5=D0=B7=20=D0=BA=D0=BE=D0=BF=D0=B8=D1=80=D0=BE=D0=B2=D0=B0?=
+ =?UTF-8?q?=D0=BD=D0=B8=D1=8F=20=D0=B8=20=D1=81=D0=BD=D0=B8=D0=BC=D0=BE?=
+ =?UTF-8?q?=D0=BA=20=D0=BF=D0=B0=D0=BD=D0=B5=D0=BB=D0=B8?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Две вещи, обе нужны для следующего шага — вывода кадров GPU и декодера
+прямо на панель.
+
+Первое: приём чужого dma-buf. Помощник CMA берёт только непрерывную
+память, а буферы ION из общей кучи рассыпаны по страницам, поэтому
+gem_prime_import_sg_table свой. Непрерывность обеспечивает M4U: страницы
+отображаются один раз при импорте, и слою отдаётся готовый MVA. Кадр из
+такого буфера уходит в панель без единого скопированного байта; обычные
+dumb-буферы по-прежнему идут через копию, у них другого пути нет.
+
+Длина отображения считается ровно так же, как в m4u_map_sgtable(), иначе
+он доходит до конца списка раньше заказанного размера и отказывает.
+
+При выключении конвейера обязательно возвращаемся на собственный буфер:
+чужой отпустят сразу после, отображение в M4U снимется, а слой продолжит
+читать тот же адрес — это отказ доступа.
+
+Второе: отладочный файл bf7disp/capture. Его чтение подключает WDMA0 к
+выходу OVL0 и отдаёт кадр, который тракт действительно вывел. Без этого
+проверить вывод можно только глазами, а телефон бывает не под рукой.
+Вендорский _screen_cap_by_cpu() в этом дереве не вызывается ниоткуда, так
+что путь непроверенный — поэтому у него единственный вызывающий, и сам по
+себе он не срабатывает никогда.
+---
+ .../mediatek/video/mt6765/videox/bf7_drm.c    | 416 +++++++++++++++++-
+ .../video/mt6765/videox/primary_display.c     |  22 +
+ .../video/mt6765/videox/primary_display.h     |   4 +
+ 3 files changed, 427 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+index 04d1f9051..3c4e58220 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+@@ -28,6 +28,8 @@
+ 
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
++#include <linux/debugfs.h>
++#include <linux/dma-buf.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/of_device.h>
+ 
+@@ -37,6 +39,7 @@
+ #include <drm/drm_gem_cma_helper.h>
+ #include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_modes.h>
++#include <drm/drm_prime.h>
+ #include <drm/drm_simple_kms_helper.h>
+ #include <drm/tinydrm/tinydrm.h>
+ #include <drm/tinydrm/tinydrm-helpers.h>
+@@ -50,6 +53,7 @@ struct bf7_drm_device {
+ 	struct tinydrm_device tinydrm;
+ 	struct drm_display_mode mode;
+ 	bool enabled;
++	bool direct_announced;
+ 
+ 	/*
+ 	 * Собственный буфер вывода.
+@@ -69,6 +73,19 @@ struct bf7_drm_device {
+ 	unsigned int pitch_px;
+ 	struct m4u_client_t *m4u_client;
+ 	struct sg_table sgt;
++
++	/*
++	 * Буфер для снимка экрана: WDMA0 пишет в него то, что тракт вывел в
++	 * панель. Заводится при первом обращении к отладочному файлу —
++	 * четыре с лишним мегабайта незачем держать просто так.
++	 */
++	void *cap_va;
++	dma_addr_t cap_pa;
++	unsigned int cap_mva;
++	size_t cap_size;
++	struct sg_table cap_sgt;
++	struct mutex cap_lock;
++	struct dentry *debugfs;
+ };
+ 
+ static inline struct bf7_drm_device *bf7_from_tinydrm(struct tinydrm_device *t)
+@@ -76,6 +93,55 @@ static inline struct bf7_drm_device *bf7_from_tinydrm(struct tinydrm_device *t)
+ 	return container_of(t, struct bf7_drm_device, tinydrm);
+ }
+ 
++/*
++ * Кадр, пришедший из чужого dma-buf.
++ *
++ * Ради этого весь драйвер и затевался: буфер, в который нарисовал GPU или
++ * который выдал декодер, показывается панели без единого копирования. Всё,
++ * что для этого нужно, — отобразить его страницы в M4U и отдать слою
++ * полученный MVA.
++ *
++ * Базой взят drm_gem_cma_object, хотя памяти CMA тут нет: так остаются
++ * работоспособными готовые помощники DRM, а drm_gem_cma_free_object() сам
++ * правильно разбирает импортированный объект (vaddr у нас NULL, а
++ * import_attach выставляет ядро DRM). Своё поле — только MVA.
++ */
++struct bf7_gem_object {
++	struct drm_gem_cma_object base;	/* обязан быть первым */
++	struct bf7_drm_device *bf7;
++	unsigned int mva;
++	unsigned int mva_size;
++};
++
++static inline struct bf7_gem_object *to_bf7_gem(struct drm_gem_object *obj)
++{
++	return container_of(to_drm_gem_cma_obj(obj), struct bf7_gem_object,
++			    base);
++}
++
++/*
++ * Порядок байтов.
++ *
++ * Имена DRM перечисляют каналы от старшего бита к младшему, имена MediaTek —
++ * в порядке байтов в памяти, поэтому они выглядят зеркально. Сверено по
++ * mtkfb_pan_display_impl(): там при blue.offset == 0, то есть при синем в
++ * младшем байте (это и есть DRM_FORMAT_XRGB8888), выбирается BGRA8888.
++ */
++static enum DISP_FORMAT bf7_disp_format(u32 drm_format)
++{
++	switch (drm_format) {
++	case DRM_FORMAT_XRGB8888:
++	case DRM_FORMAT_ARGB8888:
++		return DISP_FORMAT_BGRA8888;
++	case DRM_FORMAT_XBGR8888:
++	case DRM_FORMAT_ABGR8888:
++		/* то, что отдаёт gralloc: HAL_PIXEL_FORMAT_RGBA_8888 */
++		return DISP_FORMAT_RGBA8888;
++	default:
++		return DISP_FORMAT_UNKNOWN;
++	}
++}
++
+ /*
+  * Отправка кадра в панель.
+  *
+@@ -86,7 +152,9 @@ static inline struct bf7_drm_device *bf7_from_tinydrm(struct tinydrm_device *t)
+  * Слой берём тот же, что и mtkfb (FB_LAYER, он же 0): консоль на нём всё
+  * равно отключена, а чужие слои трогать незачем.
+  */
+-static int bf7_post_frame(struct bf7_drm_device *bf7)
++static int bf7_post_frame(struct bf7_drm_device *bf7, unsigned int mva,
++			  enum DISP_FORMAT fmt, unsigned int pitch_px,
++			  unsigned int width, unsigned int height)
+ {
+ 	struct disp_session_input_config *cfg;
+ 	struct disp_input_config *in;
+@@ -107,17 +175,18 @@ static int bf7_post_frame(struct bf7_drm_device *bf7)
+ 	in->layer_id = primary_display_get_option("FB_LAYER");
+ 	in->layer_enable = 1;
+ 	in->buffer_source = DISP_BUFFER_MVA;	/* адрес уже готов */
+-	in->src_phy_addr = (void *)(unsigned long)bf7->scanout_mva;
+-	in->src_fmt = DISP_FORMAT_BGRA8888;	/* синий в младшем байте, как XRGB8888 у DRM */
++	in->src_phy_addr = (void *)(unsigned long)mva;
++	in->src_fmt = fmt;
+ 	in->src_offset_x = 0;
+ 	in->src_offset_y = 0;
+-	in->src_width = bf7->mode.hdisplay;
+-	in->src_height = bf7->mode.vdisplay;
+-	in->src_pitch = bf7->pitch_px;		/* в ПИКСЕЛЯХ, не в байтах */
++	/* Больше панели не показываем: лишнее слой всё равно обрежет. */
++	in->src_width = min_t(unsigned int, width, bf7->mode.hdisplay);
++	in->src_height = min_t(unsigned int, height, bf7->mode.vdisplay);
++	in->src_pitch = pitch_px;		/* в ПИКСЕЛЯХ, не в байтах */
+ 	in->tgt_offset_x = 0;
+ 	in->tgt_offset_y = 0;
+-	in->tgt_width = bf7->mode.hdisplay;
+-	in->tgt_height = bf7->mode.vdisplay;
++	in->tgt_width = in->src_width;
++	in->tgt_height = in->src_height;
+ 	in->alpha_enable = 0;
+ 	in->alpha = 0xff;
+ 	in->next_buff_idx = -1;
+@@ -139,7 +208,7 @@ static int bf7_post_frame(struct bf7_drm_device *bf7)
+ 		if (first) {
+ 			first = false;
+ 			DRM_INFO("bf7: первый кадр показан (слой %u, MVA 0x%x)\n",
+-				 in->layer_id, bf7->scanout_mva);
++				 in->layer_id, mva);
+ 		}
+ 	}
+ out:
+@@ -234,6 +303,128 @@ static int bf7_alloc_scanout(struct device *dev, struct bf7_drm_device *bf7)
+ 	return ret;
+ }
+ 
++/*
++ * Снимок экрана.
++ *
++ * Зачем это в драйвере. Убедиться, что кадр дошёл до панели, иначе нельзя:
++ * при показе без копирования своего буфера у нас нет, читать нечего, а
++ * вендорский тракт молчит одинаково и когда всё хорошо, и когда слой выключен
++ * чужим кодом. WDMA0 снимает выход OVL0 — ровно то, что видит глаз.
++ *
++ * Буфер нужен отдельный: у снимка шаг строки равен ширине панели, а у буфера
++ * вывода он выровнен, и класть одно в другое значило бы портить показанное.
++ */
++static int bf7_capture_prepare(struct bf7_drm_device *bf7)
++{
++	struct device *dev = bf7->tinydrm.drm->dev;
++	unsigned int mva;
++	int ret;
++
++	if (bf7->cap_va)
++		return 0;
++
++	bf7->cap_size = PAGE_ALIGN((size_t)bf7->mode.hdisplay *
++				   bf7->mode.vdisplay * 4);
++	bf7->cap_va = dma_alloc_wc(dev, bf7->cap_size, &bf7->cap_pa,
++				   GFP_KERNEL);
++	if (!bf7->cap_va)
++		return -ENOMEM;
++
++	memset(bf7->cap_va, 0, bf7->cap_size);
++
++	if (!bf7->m4u_client) {
++		bf7->cap_mva = (unsigned int)bf7->cap_pa;
++		return 0;
++	}
++
++	ret = sg_alloc_table(&bf7->cap_sgt, 1, GFP_KERNEL);
++	if (ret)
++		goto err_free;
++
++	sg_dma_address(bf7->cap_sgt.sgl) = bf7->cap_pa;
++	sg_dma_len(bf7->cap_sgt.sgl) = bf7->cap_size;
++
++	mva = 0;
++	ret = m4u_alloc_mva(bf7->m4u_client, M4U_PORT_DISP_WDMA0, 0,
++			    &bf7->cap_sgt, bf7->cap_size,
++			    M4U_PROT_READ | M4U_PROT_WRITE, 0, &mva);
++	if (ret) {
++		DRM_ERROR("bf7: m4u_alloc_mva для снимка отказал: %d\n", ret);
++		ret = ret > 0 ? -EIO : ret;
++		goto err_sgt;
++	}
++
++	bf7->cap_mva = mva;
++	DRM_INFO("bf7: буфер снимка %zu байт, MVA 0x%x\n",
++		 bf7->cap_size, bf7->cap_mva);
++	return 0;
++
++err_sgt:
++	sg_free_table(&bf7->cap_sgt);
++err_free:
++	dma_free_wc(dev, bf7->cap_size, bf7->cap_va, bf7->cap_pa);
++	bf7->cap_va = NULL;
++	return ret;
++}
++
++static int bf7_capture_open(struct inode *inode, struct file *file)
++{
++	file->private_data = inode->i_private;
++	return 0;
++}
++
++/*
++ * Снимок делается один раз, при чтении с нулевого смещения; дальше читается
++ * уже готовый буфер. Так обычный `dd` или `cat` получает целый кадр.
++ */
++static ssize_t bf7_capture_read(struct file *file, char __user *ubuf,
++				size_t len, loff_t *ppos)
++{
++	struct bf7_drm_device *bf7 = file->private_data;
++	ssize_t ret;
++
++	mutex_lock(&bf7->cap_lock);
++
++	if (*ppos == 0) {
++		ret = bf7_capture_prepare(bf7);
++		if (ret)
++			goto out;
++
++		ret = primary_display_capture_to_mva(bf7->cap_mva);
++		if (ret) {
++			DRM_ERROR("bf7: снимок не получился: %zd\n", ret);
++			goto out;
++		}
++	}
++
++	if (!bf7->cap_va) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	ret = simple_read_from_buffer(ubuf, len, ppos, bf7->cap_va,
++				      bf7->cap_size);
++out:
++	mutex_unlock(&bf7->cap_lock);
++	return ret;
++}
++
++static const struct file_operations bf7_capture_fops = {
++	.owner = THIS_MODULE,
++	.open = bf7_capture_open,
++	.read = bf7_capture_read,
++	.llseek = default_llseek,
++};
++
++/*
++ * Показ кадра.
++ *
++ * Два пути. Если кадр лежит в чужом dma-buf — из gralloc после GPU или из
++ * декодера, — его страницы уже отображены в M4U, и слою отдаётся готовый MVA:
++ * ни одного байта не переписывается. Если кадр обычный, из dumb-буфера DRM,
++ * копируем его в собственный буфер вывода: у клиента свой шаг строки, а
++ * непрерывной памяти под произвольный dumb-буфер вендорский тракт не знает.
++ */
+ static int bf7_fb_dirty(struct drm_framebuffer *fb,
+ 			struct drm_file *file_priv, unsigned int flags,
+ 			unsigned int color, struct drm_clip_rect *clips,
+@@ -242,6 +433,7 @@ static int bf7_fb_dirty(struct drm_framebuffer *fb,
+ 	struct tinydrm_device *tdev = fb->dev->dev_private;
+ 	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
+ 	struct drm_gem_cma_object *cma_obj;
++	struct drm_gem_object *obj;
+ 	int ret;
+ 
+ 	mutex_lock(&tdev->dirty_lock);
+@@ -252,6 +444,39 @@ static int bf7_fb_dirty(struct drm_framebuffer *fb,
+ 		goto out;
+ 	}
+ 
++	obj = fb->obj[0];
++	if (!obj) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (obj->import_attach) {
++		struct bf7_gem_object *bgo = to_bf7_gem(obj);
++		enum DISP_FORMAT fmt = bf7_disp_format(fb->format->format);
++
++		if (!bgo->mva || fmt == DISP_FORMAT_UNKNOWN) {
++			ret = -EINVAL;
++			goto out;
++		}
++
++		if (!bf7->direct_announced) {
++			bf7->direct_announced = true;
++			DRM_INFO("bf7: кадр из чужого dma-buf показан без копирования (MVA 0x%x, шаг %u)\n",
++				 bgo->mva, fb->pitches[0]);
++		}
++
++		/*
++		 * Буфер жив, пока жив кадр: ссылку на кадр держит состояние
++		 * плоскости, а старое состояние атомарные помощники отпускают
++		 * уже после этого вызова. Запуск у нас блокирующий, так что к
++		 * моменту освобождения слой смотрит на новый буфер.
++		 */
++		ret = bf7_post_frame(bf7, bgo->mva + fb->offsets[0], fmt,
++				     fb->pitches[0] / 4,
++				     fb->width, fb->height);
++		goto out;
++	}
++
+ 	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
+ 	if (!cma_obj || !cma_obj->vaddr) {
+ 		ret = -EINVAL;
+@@ -275,16 +500,128 @@ static int bf7_fb_dirty(struct drm_framebuffer *fb,
+ 			       bytes);
+ 	}
+ 
+-	ret = bf7_post_frame(bf7);
++	ret = bf7_post_frame(bf7, bf7->scanout_mva, DISP_FORMAT_BGRA8888,
++			     bf7->pitch_px, bf7->mode.hdisplay,
++			     bf7->mode.vdisplay);
+ out:
+ 	mutex_unlock(&tdev->dirty_lock);
+ 	return ret;
+ }
+ 
+-static int bf7_fb_dirty(struct drm_framebuffer *fb,
+-			struct drm_file *file_priv, unsigned int flags,
+-			unsigned int color, struct drm_clip_rect *clips,
+-			unsigned int num_clips);
++/*
++ * Приём чужого dma-buf.
++ *
++ * Своей версии эта функция требует потому, что помощник CMA принимает только
++ * непрерывную память, а буферы ION из общей кучи почти всегда рассыпаны по
++ * страницам. Нам непрерывность и не нужна: её обеспечивает M4U, ради которого
++ * весь вендорский тракт и работает с MVA вместо физических адресов.
++ */
++static struct drm_gem_object *
++bf7_gem_prime_import_sg_table(struct drm_device *drm,
++			      struct dma_buf_attachment *attach,
++			      struct sg_table *sgt)
++{
++	struct tinydrm_device *tdev = drm->dev_private;
++	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
++	struct bf7_gem_object *bgo;
++	struct scatterlist *sg;
++	unsigned int total = 0;
++	unsigned int mva = 0;
++	size_t size = attach->dmabuf->size;
++	int i, ret;
++
++	bgo = kzalloc(sizeof(*bgo), GFP_KERNEL);
++	if (!bgo)
++		return ERR_PTR(-ENOMEM);
++
++	drm_gem_private_object_init(drm, &bgo->base.base, size);
++	bgo->base.sgt = sgt;
++	bgo->base.vaddr = NULL;	/* по нему drm_gem_cma_free_object() и различает */
++	bgo->bf7 = bf7;
++
++	if (!bf7->m4u_client) {
++		/* M4U выключен: годится только уже непрерывный буфер. */
++		if (sgt->nents != 1) {
++			ret = -EINVAL;
++			goto err;
++		}
++		bgo->mva = sg_dma_address(sgt->sgl) ?
++			   (unsigned int)sg_dma_address(sgt->sgl) :
++			   (unsigned int)sg_phys(sgt->sgl);
++		return &bgo->base.base;
++	}
++
++	/*
++	 * Длину считаем ровно так же, как m4u_map_sgtable(): иначе он дойдёт
++	 * до конца списка раньше заказанного размера и откажет. Просить
++	 * PAGE_ALIGN(size) нельзя по той же причине.
++	 */
++	for_each_sg(sgt->sgl, sg, sgt->nents, i) {
++		unsigned int len = sg_dma_len(sg);
++
++		if (!sg_dma_address(sg))
++			len = sg->length;
++		total += len;
++	}
++
++	if (total < size) {
++		DRM_ERROR("bf7: в dma-buf на %zu байт отображено только %u\n",
++			  size, total);
++		ret = -EINVAL;
++		goto err;
++	}
++
++	ret = m4u_alloc_mva(bf7->m4u_client, M4U_PORT_DISP_OVL0, 0, sgt,
++			    total, M4U_PROT_READ, 0, &mva);
++	if (ret) {
++		DRM_ERROR("bf7: m4u_alloc_mva для dma-buf отказал: %d\n", ret);
++		ret = ret > 0 ? -EIO : ret;
++		goto err;
++	}
++
++	bgo->mva = mva;
++	bgo->mva_size = total;
++	DRM_DEBUG_PRIME("bf7: dma-buf %zu байт -> MVA 0x%x (%u кусков)\n",
++			size, mva, sgt->nents);
++	return &bgo->base.base;
++
++err:
++	drm_gem_object_release(&bgo->base.base);
++	kfree(bgo);
++	return ERR_PTR(ret);
++}
++
++static void bf7_gem_free_object(struct drm_gem_object *obj)
++{
++	if (obj->import_attach) {
++		struct bf7_gem_object *bgo = to_bf7_gem(obj);
++
++		if (bgo->mva && bgo->bf7->m4u_client)
++			m4u_dealloc_mva(bgo->bf7->m4u_client,
++					M4U_PORT_DISP_OVL0, bgo->mva);
++		/*
++		 * Именно помощник CMA, а не обёртка tinydrm: та первым делом
++		 * снимает отображение в ядре, которого мы не делали.
++		 */
++		drm_gem_cma_free_object(obj);
++		return;
++	}
++
++	tinydrm_gem_cma_free_object(obj);
++}
++
++/*
++ * Отображать импортированный объект в память процесса незачем: у клиента уже
++ * есть его dma-buf, а помощник CMA полез бы по нулевому адресу.
++ */
++static int bf7_gem_prime_mmap(struct drm_gem_object *obj,
++			      struct vm_area_struct *vma)
++{
++	if (obj->import_attach)
++		return -EINVAL;
++
++	return drm_gem_cma_prime_mmap(obj, vma);
++}
+ 
+ static const struct drm_framebuffer_funcs bf7_fb_funcs = {
+ 	.destroy	= drm_gem_fb_destroy,
+@@ -318,6 +655,22 @@ static void bf7_pipe_disable(struct drm_simple_display_pipe *pipe)
+ 	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
+ 
+ 	DRM_DEBUG_KMS("bf7: выключение конвейера\n");
++
++	/*
++	 * Обязательно уходим со чужого буфера на свой.
++	 *
++	 * Кадр отпустят сразу после выключения, вместе с ним снимется
++	 * отображение в M4U — а слой продолжит читать тот же MVA и получит
++	 * отказ доступа. Свой буфер отображён на всё время жизни драйвера,
++	 * так что показать чёрное из него безопасно.
++	 */
++	if (bf7->enabled) {
++		memset(bf7->scanout_va, 0, bf7->scanout_size);
++		bf7_post_frame(bf7, bf7->scanout_mva, DISP_FORMAT_BGRA8888,
++			       bf7->pitch_px, bf7->mode.hdisplay,
++			       bf7->mode.vdisplay);
++	}
++
+ 	bf7->enabled = false;
+ }
+ 
+@@ -331,6 +684,9 @@ static const struct drm_simple_display_pipe_funcs bf7_pipe_funcs = {
+ static const uint32_t bf7_formats[] = {
+ 	DRM_FORMAT_XRGB8888,
+ 	DRM_FORMAT_ARGB8888,
++	/* так gralloc отдаёт то, во что нарисовал GPU */
++	DRM_FORMAT_XBGR8888,
++	DRM_FORMAT_ABGR8888,
+ };
+ 
+ DEFINE_DRM_GEM_CMA_FOPS(bf7_fops);
+@@ -339,7 +695,24 @@ static struct drm_driver bf7_drm_driver = {
+ 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_PRIME |
+ 				  DRIVER_ATOMIC,
+ 	.fops			= &bf7_fops,
+-	TINYDRM_GEM_DRIVER_OPS,
++	/*
++	 * TINYDRM_GEM_DRIVER_OPS раскрыт вручную: три операции из него нам
++	 * нужны свои, а переопределять поля повторной инициализацией — читать
++	 * потом невозможно.
++	 */
++	.gem_free_object_unlocked = bf7_gem_free_object,
++	.gem_print_info		= drm_gem_cma_print_info,
++	.gem_vm_ops		= &drm_gem_cma_vm_ops,
++	.prime_handle_to_fd	= drm_gem_prime_handle_to_fd,
++	.prime_fd_to_handle	= drm_gem_prime_fd_to_handle,
++	.gem_prime_import	= drm_gem_prime_import,
++	.gem_prime_export	= drm_gem_prime_export,
++	.gem_prime_get_sg_table	= drm_gem_cma_prime_get_sg_table,
++	.gem_prime_import_sg_table = bf7_gem_prime_import_sg_table,
++	.gem_prime_vmap		= drm_gem_cma_prime_vmap,
++	.gem_prime_vunmap	= drm_gem_cma_prime_vunmap,
++	.gem_prime_mmap		= bf7_gem_prime_mmap,
++	.dumb_create		= drm_gem_cma_dumb_create,
+ 	.name			= "bf7disp",
+ 	.desc			= "BF7 display over MediaTek primary_display",
+ 	.date			= "20260916",
+@@ -382,6 +755,8 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ 	if (!bf7)
+ 		return -ENOMEM;
+ 
++	mutex_init(&bf7->cap_lock);
++
+ 	/*
+ 	 * primary_display_init() зовёт mtkfb и только он — функция не
+ 	 * идемпотентна. Ждём, пока он поднимет дисплей.
+@@ -444,6 +819,15 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ 		return ret;
+ 	}
+ 
++	/*
++	 * Отладочный файл снимка. Его чтение — единственный способ запустить
++	 * вендорский захват, сам по себе он не срабатывает.
++	 */
++	bf7->debugfs = debugfs_create_dir("bf7disp", NULL);
++	if (!IS_ERR_OR_NULL(bf7->debugfs))
++		debugfs_create_file("capture", 0400, bf7->debugfs, bf7,
++				    &bf7_capture_fops);
++
+ 	dev_info(dev, "KMS поверх вендорского тракта: %ux%u\n", w, h);
+ 	return 0;
+ }
+@@ -451,7 +835,9 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ static int bf7_drm_remove(struct platform_device *pdev)
+ {
+ 	struct tinydrm_device *tdev = platform_get_drvdata(pdev);
++	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
+ 
++	debugfs_remove_recursive(bf7->debugfs);
+ 	tinydrm_shutdown(tdev);
+ 	return 0;
+ }
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+index 4f09cb7a3..bd5642495 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+@@ -8514,6 +8514,28 @@ static int _screen_cap_by_cpu(unsigned int mva, enum UNIFIED_COLOR_FMT ufmt,
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_DRM_BF7_DISP)
++/*
++ * BF7: снимок того, что тракт дисплея действительно вывел.
++ *
++ * Обёртка над _screen_cap_by_cpu(): та подключает WDMA0 к выходу OVL0 и
++ * получает ровно тот кадр, который ушёл в панель, — включая слои, которых мы
++ * не ставили. Без неё проверить вывод можно только глазами, а телефон бывает
++ * не под рукой.
++ *
++ * Формат BGRA8888 выбран не случайно: синий в младшем байте, то есть снимок
++ * читается как DRM_FORMAT_XRGB8888 без перестановки байтов.
++ *
++ * Функция статическая и в этом дереве ни разу не вызывается, так что путь
++ * непроверенный; поэтому у неё единственный вызывающий — отладочный файл,
++ * и сама собой она не срабатывает никогда.
++ */
++int primary_display_capture_to_mva(unsigned int mva)
++{
++	return _screen_cap_by_cpu(mva, UFMT_BGRA8888, DISP_MODULE_OVL0);
++}
++#endif
++
+ int primary_display_capture_framebuffer(unsigned long pbuf)
+ {
+ 	unsigned int fb_layer_id = primary_display_get_option("FB_LAYER");
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/primary_display.h b/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
+index 7d52e18a3..52797c977 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
++++ b/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
+@@ -409,6 +409,10 @@ int primary_display_diagnose(void);
+ 
+ int primary_display_get_info(struct disp_session_info *info);
+ int primary_display_capture_framebuffer(unsigned long pbuf);
++#if IS_ENABLED(CONFIG_DRM_BF7_DISP)
++/* BF7: снимок выхода OVL0 в буфер, отображённый в M4U. */
++int primary_display_capture_to_mva(unsigned int mva);
++#endif
+ int primary_display_is_video_mode(void);
+ int primary_is_sec(void);
+ int do_primary_display_switch_mode(int sess_mode, unsigned int session,
+-- 
+2.55.0
+

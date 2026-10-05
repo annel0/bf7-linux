@@ -1,0 +1,336 @@
+From f42d012ca5eb43ab4871590859d31ccf8e792f0d Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Tue, 22 Sep 2026 23:37:32 +0300
+Subject: [PATCH 09/40] =?UTF-8?q?=D0=97=D0=B2=D1=83=D0=BA:=20=D0=BA=D0=BE?=
+ =?UTF-8?q?=D0=BF=D0=B8=D1=80=D0=BE=D0=B2=D0=B0=D0=BD=D0=B8=D0=B5=20=D0=B2?=
+ =?UTF-8?q?=20=D0=BF=D0=B0=D0=BC=D1=8F=D1=82=D1=8C=20=D1=83=D1=81=D1=82?=
+ =?UTF-8?q?=D1=80=D0=BE=D0=B9=D1=81=D1=82=D0=B2=D0=B0=20=E2=80=94=20=D1=82?=
+ =?UTF-8?q?=D0=BE=D0=BB=D1=8C=D0=BA=D0=BE=20=D1=87=D0=B5=D1=80=D0=B5=D0=B7?=
+ =?UTF-8?q?=20=D0=BF=D0=BE=D1=81=D1=80=D0=B5=D0=B4=D0=BD=D0=B8=D0=BA=D0=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+На arm64 copy_from_user/copy_to_user выравнивают доступ по источнику, а
+другую сторону пишут невыровненными 8-байтными и парными LDP/STP. Буфер
+DMA звукового тракта отображён как память устройства, где такой доступ
+даёт alignment fault (ESR 0x96000021) — ядро падало и при воспроизведении,
+и при записи.
+
+Общая пара bf7_copy_from_user_io/bf7_copy_to_user_io в afe-control
+копирует через обычный буфер и memcpy_toio/memcpy_fromio, которые
+выравнивают со стороны устройства. Переведены afe-control, pcm-dl1,
+pcm-hdmi, pcm-bt-dai и обе версии dataTransfer в pcm-dl2 (живая, под
+AUDIO_DL2_ISR_COPY_SUPPORT, писала обычным memcpy).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek/common_int/mtk-soc-afe-control.c | 95 +++++++++++++++++--
+ .../mediatek/common_int/mtk-soc-afe-control.h |  5 +
+ .../mediatek/common_int/mtk-soc-pcm-bt-dai.c  |  7 +-
+ .../soc/mediatek/common_int/mtk-soc-pcm-dl1.c |  9 +-
+ .../soc/mediatek/common_int/mtk-soc-pcm-dl2.c |  7 +-
+ .../mediatek/common_int/mtk-soc-pcm-hdmi.c    |  6 +-
+ 6 files changed, 112 insertions(+), 17 deletions(-)
+
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-afe-control.c b/sound/soc/mediatek/common_int/mtk-soc-afe-control.c
+index a82703005..42b88425d 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-afe-control.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-afe-control.c
+@@ -73,6 +73,89 @@
+ #include <mtk_vcorefs_manager.h>
+ #endif
+ 
++/*
++ * BF7: обмен с буфером DMA звука в обход выравнивания.
++ *
++ * Буфер AFE отображён как память устройства — об этом прямо сказано ниже, у
++ * word_size_align. Такая память принимает только естественно выровненные
++ * доступы, а copy_from_user/copy_to_user на arm64 этого не обещают:
++ * реализация выравнивается по **источнику**, а на другой стороне работает
++ * восьмибайтовыми и парными командами по любому адресу.
++ *
++ * Поэтому выравнивать свою сторону бесполезно — проверено на живом телефоне:
++ * побайтовые края с выровненной серединой дали ту же панику по тому же
++ * адресу. Нужен посредник в обычной памяти и memcpy_toio/memcpy_fromio,
++ * которые выравниваются именно по стороне устройства.
++ *
++ * Роняется по заказу (до правки):
++ *   aplay   -D hw:0,0 -f S16_LE -r 48000 -c 2 \
++ *           --period-size=1021 --buffer-size=4084 /dev/urandom
++ *   arecord -D hw:0,1 -f S16_LE -r 48000 -c 2 \
++ *           --period-size=33 --buffer-size=133 -d 4 /dev/null
++ * Первое давало ESR 0x96000021 на записи, второе — на чтении.
++ */
++#define BF7_BOUNCE_SIZE 4096
++
++int bf7_copy_from_user_io(void *dst, const void __user *src, unsigned long bytes)
++{
++	void *bounce;
++	int ret = 0;
++
++	bounce = kmalloc(BF7_BOUNCE_SIZE, GFP_KERNEL);
++	if (!bounce)
++		return -ENOMEM;
++
++	while (bytes) {
++		unsigned long chunk = bytes;
++
++		if (chunk > BF7_BOUNCE_SIZE)
++			chunk = BF7_BOUNCE_SIZE;
++
++		if (copy_from_user(bounce, src, chunk)) {
++			ret = -EFAULT;
++			break;
++		}
++		memcpy_toio((void __iomem *)dst, bounce, chunk);
++
++		dst = (char *)dst + chunk;
++		src = (const char __user *)src + chunk;
++		bytes -= chunk;
++	}
++
++	kfree(bounce);
++	return ret;
++}
++
++int bf7_copy_to_user_io(void __user *dst, const void *src, unsigned long bytes)
++{
++	void *bounce;
++	int ret = 0;
++
++	bounce = kmalloc(BF7_BOUNCE_SIZE, GFP_KERNEL);
++	if (!bounce)
++		return -ENOMEM;
++
++	while (bytes) {
++		unsigned long chunk = bytes;
++
++		if (chunk > BF7_BOUNCE_SIZE)
++			chunk = BF7_BOUNCE_SIZE;
++
++		memcpy_fromio(bounce, (const void __iomem *)src, chunk);
++		if (copy_to_user(dst, bounce, chunk)) {
++			ret = -EFAULT;
++			break;
++		}
++
++		dst = (char __user *)dst + chunk;
++		src = (const char *)src + chunk;
++		bytes -= chunk;
++	}
++
++	kfree(bounce);
++	return ret;
++}
++
+ static DEFINE_SPINLOCK(afe_control_lock);
+ static DEFINE_SPINLOCK(afe_sram_control_lock);
+ static DEFINE_SPINLOCK(afe_mem_blk_dl1_lock);
+@@ -4616,7 +4699,7 @@ static int mtk_mem_dlblk_copy(struct snd_pcm_substream *substream, int channel,
+ 					Afe_WriteIdx_tmp,
+ 					data_w_ptr, copy_size);
+ #endif
+-				if (copy_from_user((Afe_Block->pucVirtBufAddr +
++				if (bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						    Afe_WriteIdx_tmp),
+ 						   data_w_ptr, copy_size)) {
+ 					pr_warn("[AudioWarn] Fail copy from user\n");
+@@ -4661,7 +4744,7 @@ static int mtk_mem_dlblk_copy(struct snd_pcm_substream *substream, int channel,
+ 					Afe_WriteIdx_tmp,
+ 					data_w_ptr, size_1);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    data_w_ptr, size_1))) {
+ 					pr_warn(" Fail 1 copy from user");
+@@ -4690,7 +4773,7 @@ static int mtk_mem_dlblk_copy(struct snd_pcm_substream *substream, int channel,
+ 					Afe_WriteIdx_tmp,
+ 					data_w_ptr + size_1, size_2);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    (data_w_ptr + size_1),
+ 						    size_2))) {
+@@ -4798,7 +4881,7 @@ static int mtk_mem_ulblk_copy(struct snd_pcm_substream *substream, int channel,
+ 				DMA_Read_Ptr, Vul_Block->u4DMAReadIdx);
+ 		}
+ 
+-		if (copy_to_user((void __user *)Read_Data_Ptr,
++		if (bf7_copy_to_user_io((void __user *)Read_Data_Ptr,
+ 				 (Vul_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 read_size)) {
+ 
+@@ -4839,7 +4922,7 @@ static int mtk_mem_ulblk_copy(struct snd_pcm_substream *substream, int channel,
+ 				__func__, size_1, Vul_Block->u4DataRemained,
+ 				DMA_Read_Ptr, Vul_Block->u4DMAReadIdx);
+ 		}
+-		if (copy_to_user((void __user *)Read_Data_Ptr,
++		if (bf7_copy_to_user_io((void __user *)Read_Data_Ptr,
+ 				 (Vul_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 (unsigned int)size_1)) {
+ 
+@@ -4870,7 +4953,7 @@ static int mtk_mem_ulblk_copy(struct snd_pcm_substream *substream, int channel,
+ 				__func__, size_2, Vul_Block->u4DataRemained,
+ 				DMA_Read_Ptr, Vul_Block->u4DMAReadIdx);
+ 		}
+-		if (copy_to_user((void __user *)(Read_Data_Ptr + size_1),
++		if (bf7_copy_to_user_io((void __user *)(Read_Data_Ptr + size_1),
+ 				 (Vul_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 size_2)) {
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-afe-control.h b/sound/soc/mediatek/common_int/mtk-soc-afe-control.h
+index 725abbccf..34e4f5989 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-afe-control.h
++++ b/sound/soc/mediatek/common_int/mtk-soc-afe-control.h
+@@ -389,4 +389,9 @@ int mtk_afe_pcm_copy(struct snd_pcm_substream *substream,
+ 		     int channel, unsigned long hwoff,
+ 		     void *buf, unsigned long bytes);
+ 
++
++/* BF7: обмен с буфером DMA звука через посредника, см. mtk-soc-afe-control.c */
++int bf7_copy_from_user_io(void *dst, const void __user *src, unsigned long bytes);
++int bf7_copy_to_user_io(void __user *dst, const void *src, unsigned long bytes);
++
+ #endif
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
+index a124ff349..d7e591b06 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
+@@ -35,6 +35,7 @@
+  *                E X T E R N A L   R E F E R E N C E S
+  *****************************************************************************/
+ 
++#include "mtk-soc-afe-control.h"
+ #include "mtk-soc-pcm-common.h"
+ #include "mtk-soc-pcm-platform.h"
+ #include <linux/dma-mapping.h>
+@@ -345,7 +346,7 @@ static int mtk_bt_dai_pcm_copy(struct snd_pcm_substream *substream, int channel,
+ 				DMA_Read_Ptr, Dai_Block->u4DMAReadIdx);
+ 		}
+ 
+-		if (copy_to_user((void __user *)Read_Data_Ptr,
++		if (bf7_copy_to_user_io((void __user *)Read_Data_Ptr,
+ 				 (Dai_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 read_size)) {
+ 
+@@ -385,7 +386,7 @@ static int mtk_bt_dai_pcm_copy(struct snd_pcm_substream *substream, int channel,
+ 				__func__, size_1, Dai_Block->u4DataRemained,
+ 				DMA_Read_Ptr, Dai_Block->u4DMAReadIdx);
+ 		}
+-		if (copy_to_user((void __user *)Read_Data_Ptr,
++		if (bf7_copy_to_user_io((void __user *)Read_Data_Ptr,
+ 				 (Dai_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 size_1)) {
+ 
+@@ -417,7 +418,7 @@ static int mtk_bt_dai_pcm_copy(struct snd_pcm_substream *substream, int channel,
+ 				__func__, size_2, Dai_Block->u4DataRemained,
+ 				DMA_Read_Ptr, Dai_Block->u4DMAReadIdx);
+ 		}
+-		if (copy_to_user((void __user *)(Read_Data_Ptr + size_1),
++		if (bf7_copy_to_user_io((void __user *)(Read_Data_Ptr + size_1),
+ 				 (Dai_Block->pucVirtBufAddr + DMA_Read_Ptr),
+ 				 size_2)) {
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+index 6374c2df1..e3319bbca 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+@@ -350,6 +350,9 @@ static int mtk_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	return -EINVAL;
+ }
+ 
++
++/* BF7: bf7_copy_from_user_io живёт в mtk-soc-afe-control.c */
++
+ static int mtk_pcm_copy(struct snd_pcm_substream *substream,
+ 			int channel,
+ 			unsigned long pos,
+@@ -428,7 +431,7 @@ static int mtk_pcm_copy(struct snd_pcm_substream *substream,
+ 						Afe_WriteIdx_tmp,
+ 					data_w_ptr, copy_size);
+ #endif
+-				if (copy_from_user((Afe_Block->pucVirtBufAddr +
++				if (bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						    Afe_WriteIdx_tmp),
+ 						   data_w_ptr, copy_size)) {
+ #if defined(DL1_DEBUG_LOG)
+@@ -477,7 +480,7 @@ static int mtk_pcm_copy(struct snd_pcm_substream *substream,
+ 						Afe_WriteIdx_tmp,
+ 					data_w_ptr, size_1);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    data_w_ptr,
+ 						    (unsigned int)size_1))) {
+@@ -513,7 +516,7 @@ static int mtk_pcm_copy(struct snd_pcm_substream *substream,
+ 					data_w_ptr + size_1,
+ 					(unsigned int)size_2);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    (data_w_ptr + size_1),
+ 						    size_2))) {
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
+index 220f76997..fb20e02d9 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
+@@ -712,7 +712,10 @@ static int dataTransfer(void *dest, const void *src, uint32_t size)
+ 		return 0;
+ 	}
+ 
+-	memcpy(dest, src, size);
++	/* BF7: dest — буфер DMA, память устройства; обычный memcpy тут роняет
++	 * ядро сбоем выравнивания, memcpy_toio выравнивается по приёмнику.
++	 */
++	memcpy_toio((void __iomem *)dest, src, size);
+ 	return 0;
+ }
+ 
+@@ -894,7 +897,7 @@ static int dataTransfer(void *dest, const void *src, uint32_t size)
+ 			"memcpy VirtBufAddr+Afe_WriteIdx= %p,data_w_ptr = %p copy_size = 0x%x\n",
+ 			dest, src, size);
+ #endif
+-		if (unlikely(copy_from_user(dest, src, size))) {
++		if (unlikely(bf7_copy_from_user_io(dest, src, size))) {
+ #if defined(DL2_DEBUG_LOG)
+ 			pr_debug("AudDrv_write Fail copy from user\n");
+ #endif
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
+index 9d9b227f7..4c2e08979 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
+@@ -850,7 +850,7 @@ static int mtk_pcm_hdmi_copy(struct snd_pcm_substream *substream,
+ 							  Afe_WriteIdx_tmp,
+ 					data_w_ptr, copy_size);
+ #endif
+-				if (copy_from_user((Afe_Block->pucVirtBufAddr +
++				if (bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						    Afe_WriteIdx_tmp),
+ 						   data_w_ptr, copy_size)) {
+ #if defined(HDMI_DEBUG_LOG)
+@@ -895,7 +895,7 @@ static int mtk_pcm_hdmi_copy(struct snd_pcm_substream *substream,
+ 							  Afe_WriteIdx_tmp,
+ 					data_w_ptr, size_1);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    data_w_ptr, size_1))) {
+ #if defined(HDMI_DEBUG_LOG)
+@@ -928,7 +928,7 @@ static int mtk_pcm_hdmi_copy(struct snd_pcm_substream *substream,
+ 							  Afe_WriteIdx_tmp,
+ 					data_w_ptr + size_1, size_2);
+ #endif
+-				if ((copy_from_user((Afe_Block->pucVirtBufAddr +
++				if ((bf7_copy_from_user_io((Afe_Block->pucVirtBufAddr +
+ 						     Afe_WriteIdx_tmp),
+ 						    (data_w_ptr + size_1),
+ 						    size_2))) {
+-- 
+2.55.0
+

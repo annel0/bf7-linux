@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Снимок экрана
+Name[en]=Screenshot
+Comment=Снять экран через 3 секунды
+Exec=/usr/local/bin/bf7-snimok
+Icon=applets-screenshooter
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-Purism-FormFactor=Workstation;Mobile;

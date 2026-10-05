@@ -1,0 +1,2 @@
+# Узел камеры — как на обычной системе Debian: чтение и запись группе video.
+KERNEL=="video[0-9]*", SUBSYSTEM=="video4linux", GROUP="video", MODE="0660"

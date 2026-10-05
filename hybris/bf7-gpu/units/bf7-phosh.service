@@ -1,0 +1,103 @@
+[Unit]
+# BF7: телефонный сеанс — композитор phoc с оболочкой Phosh.
+#
+# Второй сеанс рядом с обычным рабочим столом (bf7-session), а не вместо него:
+# оба держат одну панель, поэтому взаимно исключаются. Переключение —
+# systemctl start/stop, по одному за раз.
+#
+# Три подпорки в LD_PRELOAD (разделитель — двоеточие, не пробел: строку разбирает
+# systemd, а не оболочка):
+#   libbf7eglfilter.so — прячет EGL_EXT_platform_device (иначе wlroots уходит в
+#     ветку, где дисплей умеет создавать только Mesa), дописывает
+#     GL_EXT_unpack_subimage, подставляет узел рендера для bf7disp и отвечает
+#     за pvrsrvkm на drmGetCap(DRM_CAP_PRIME);
+#   libbf7wlegl.so — объявляет android_wlegl; основной путь у клиентов теперь
+#     linux-dmabuf, это запасной.
+#
+# Композитор обычный, /usr/bin/phoc — но пакет наш: 0.24.0-1+bf7.1, собранный
+# с заплаткой hybris/bf7-patches/phoc-0.24-touch-wake.patch и закреплённый
+# через apt-mark hold. В исходном 0.24.0-1 нажатие при погашенном экране
+# отбрасывалось раньше, чем вызывался wlr_idle_notify_activity, и разбудить
+# телефон касанием было нельзя вовсе — только кнопкой питания. Из-за этого же
+# экран блокировки выглядел «глотающим касания»: он гаснет быстро, а каждое
+# следующее нажатие уходило в никуда. С заплаткой пароль вводится пальцем,
+# оболочка при этом обычная, пакетная.
+#
+# Пакетом, а не файлом в /usr/local: двоичный файл связан с libwlroots10 по
+# имени библиотеки, и смена её ABI оставила бы нерабочую службу с виду
+# исправной. Запасная копия всё же лежит в /usr/local/bin/bf7-phoc.
+#
+# Оболочка по-прежнему поднимается разблокированной (--unlocked в
+# bf7-phosh-session): при первом запуске спрашивать пароль незачем.
+#
+# GDK_GL=gles обязателен: GtkGLArea даже в режиме ES зовёт настольную
+# glDrawBuffer, и epoxy прекращает работу. Заданный композитору, он достаётся
+# и всемпрограммам, которые оболочка запускает.
+Description=Телефонный сеанс BF7 (phoc + Phosh)
+# Звуковой сервер в порядке не участвует нарочно. Он поднимается около 52-й
+# секунды загрузки, и пока стоял в After=, сеанс ждал его — экран появлялся на
+# пять секунд позже без всякой нужды. Wants= оставлен: звук всё равно
+# поднимется, просто своим чередом, а клиенты подключатся к нему по мере
+# надобности.
+After=bf7-android-mounts.service bf7-binderfs.service dbus.service
+Wants=bf7-pulse.service
+Requires=bf7-android-mounts.service
+Conflicts=bf7-session.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/bf7-phosh
+Environment=WLR_BACKENDS=drm,libinput
+Environment=WLR_DRM_DEVICES=/dev/dri/card1
+Environment=WLR_RENDERER=gles2
+Environment=WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
+Environment=WLR_DRM_NO_MODIFIERS=1
+Environment=LD_PRELOAD=/usr/local/lib/libbf7eglfilter.so:/usr/local/lib/libbf7wlegl.so
+Environment=GDK_BACKEND=wayland
+Environment=GDK_GL=gles
+# GTK4 рисует процессором (Cairo), а не через GPU. GDK_DEBUG=gl-gles с
+# 14:57 до 21:10 2026-09-25 давал 60 к/с только с ранней фиксацией кадра в
+# libhybris, а она показала на панели недорисованный кадр «Контактов» (обои
+# сквозь окно). С безопасной фиксацией GPU — 44–46 к/с с рывками, Cairo —
+# ровные 60 к/с (процессора ~28 % больше при прокрутке). Хозяину важна
+# плавность.
+# GStreamer. Настольного OpenGL у нас нет — без GST_GL_API GstGL заводит
+# контекст «opengl3» и glupload отказывает (так WebKit не мог показать кадр
+# декодера). vah264dec — аппаратный H.264 через наш VA-драйвер; у libva с
+# незнакомым драйвером его ранг 0, и playbin брал программный avdec.
+Environment=GST_GL_API=gles2
+Environment=GST_PLUGIN_FEATURE_RANK=vah264dec:MAX
+# Здесь стояло WEBKIT_DISABLE_COMPOSITING_MODE=1 — подпорка против
+# «Could not create GBM EGL display: EGL_NOT_INITIALIZED». Снята 2026-09-22:
+# та причина закрыта заплаткой в libhybris (общий дисплей EGL, см.
+# hybris/bf7-patches/libhybris-bf7.patch), и браузер теперь рисует страницы
+# с ускорением. Заодно выяснилось, что подпорка и не помогала: пустая
+# страница была от блокировщика рекламы, а не от композиции.
+Environment=XDG_CURRENT_DESKTOP=Phosh:GNOME
+Environment=XDG_SESSION_DESKTOP=phosh
+# Свой состав сеанса лежит в /usr/local/share/gnome-session/sessions/. Путь
+# приходится задавать явно: XDG_DATA_DIRS в сеансе не выставлен, а без него
+# gnome-session смотрит только в /usr/share и берёт пакетный список из
+# восемнадцати служб настроек. Подробности — в самом файле сеанса.
+Environment=XDG_DATA_DIRS=/usr/local/share:/usr/share
+Environment=XDG_SESSION_TYPE=wayland
+# Язык сеанса. Было C.UTF-8 — вместе с выброшенными переводами (см.
+# dpkg/zz-bf7-ru-locale) это давало английский интерфейс и дату «Среда,
+# сентября 23». /etc/default/locale systemd сам не читает, поэтому явно.
+Environment=LANG=ru_RU.UTF-8
+Environment=HOME=/root
+Environment=PULSE_RUNTIME_PATH=/run/bf7-pulse
+Environment=PULSE_SERVER=unix:/run/bf7-pulse/native
+RuntimeDirectory=bf7-phosh
+RuntimeDirectoryMode=0700
+ExecStartPre=/bin/sh -c 'echo 140 > /sys/class/leds/lcd-backlight/brightness'
+ExecStart=/usr/bin/dbus-run-session -- /usr/bin/phoc -S -C /etc/phosh/phoc.ini -E /usr/local/bin/bf7-phosh-session
+# Возвращаться после падения обязательно: без этого одна случайная беда
+# оставляет телефон с чёрным экраном до ручного вмешательства. Пауза в пять
+# секунд — чтобы при устойчивой поломке не крутиться вхолостую.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,13 @@
+# BF7: вывод ШИМ подсветки (GPIO43) следует за подсветкой.
+#
+# Модуль bf7_backlight шлёт «change» с BF7_PODSVETKA=1/0 при каждом включении
+# и гашении. Погашена — вывод в обычный GPIO с «0»; горит — функция DISP_PWM
+# (mode 1). Без этого после глубокого сна, пока экран погашен, дисплейный блок
+# обесточен, вывод ШИМ «висит» в единице, и микросхема подсветки светит на
+# полную (~377 мА, пустой светящийся экран; 2026-09-24).
+# Права mt_gpio по умолчанию 0444 — отсюда chmod. Без переменных оболочки:
+# udev сам подставляет всё, что начинается с $ (так правило молча не работало).
+ACTION=="change", SUBSYSTEM=="backlight", KERNEL=="bf7-backlight", ENV{BF7_PODSVETKA}=="0", \
+  RUN+="/bin/sh -c 'chmod 644 /sys/devices/platform/pinctrl@10005000/mt_gpio; echo mode 43 0 > /sys/devices/platform/pinctrl@10005000/mt_gpio; echo out 43 0 > /sys/devices/platform/pinctrl@10005000/mt_gpio'"
+ACTION=="change", SUBSYSTEM=="backlight", KERNEL=="bf7-backlight", ENV{BF7_PODSVETKA}=="1", \
+  RUN+="/bin/sh -c 'chmod 644 /sys/devices/platform/pinctrl@10005000/mt_gpio; echo mode 43 1 > /sys/devices/platform/pinctrl@10005000/mt_gpio'"

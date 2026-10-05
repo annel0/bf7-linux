@@ -1,0 +1,22 @@
+--- a/video/out/wayland_common.c
++++ b/video/out/wayland_common.c
+@@ -821,8 +821,18 @@
+     wl->toplevel_height = height;
+ 
+     /* Don't do anything here if we haven't finished setting geometry. */
+-    if (mp_rect_w(wl->geometry) == 0 || mp_rect_h(wl->geometry) == 0)
++    if (mp_rect_w(wl->geometry) == 0 || mp_rect_h(wl->geometry) == 0) {
++        /*
++         * BF7: forget this size, or the next configure with the same size
++         * is taken for "nothing changed" below and never applied. phoc
++         * maximizes every window: its first configure (360x734) arrives
++         * before geometry is set, the second one repeats it, and mpv stayed
++         * at 1280x720 - larger than the phone screen, the picture cropped.
++         */
++        wl->toplevel_width = old_toplevel_width;
++        wl->toplevel_height = old_toplevel_height;
+         return;
++    }
+ 
+     bool is_maximized = false;
+     bool is_fullscreen = false;

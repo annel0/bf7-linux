@@ -1,0 +1,17 @@
+[Unit]
+# BF7: будильник, звонящий и во сне телефона (подробности — в самом
+# /usr/local/bin/bf7-budilnik). Будильники заводятся в GNOME Clocks.
+Description=Будильник BF7: будит телефон к звонку GNOME Clocks
+After=bf7-phosh.service
+Wants=bf7-phosh.service
+
+[Service]
+Type=simple
+Environment=HOME=/root
+Environment=XDG_RUNTIME_DIR=/run/bf7-phosh
+ExecStart=/usr/local/bin/bf7-budilnik
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

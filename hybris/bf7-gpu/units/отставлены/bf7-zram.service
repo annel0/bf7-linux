@@ -1,0 +1,29 @@
+# ОТСТАВЛЕНА 2026-09-23. Заведена 16 сентября как обход: systemd считал себя
+# в контейнере (лишний /.dockerenv от сборки образа) и не обслуживал юниты
+# .swap. Та причина устранена в тот же день, и своп на zram поднимает сам
+# systemd — генератор (/etc/systemd/zram-generator.conf: zstd, swap-priority
+# = 100) создаёт dev-zram0.swap. Эта служба дублировала его и проигрывала
+# гонку: «swapon: Device or resource busy», система «degraded» (стало видно,
+# когда загрузка ускорилась до 24 с).
+[Unit]
+Description=Включение свопа в сжатой памяти
+Requires=systemd-zram-setup@zram0.service
+After=systemd-zram-setup@zram0.service
+DefaultDependencies=no
+Before=sysinit.target
+# Юнит типа .swap systemd отказывается обслуживать, пока считает систему
+# контейнером (см. /.dockerenv). Этот вариант работает в любом случае.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Судим по итогу, а не по попытке. Своп в сжатой памяти включает ещё и
+# systemd-zram-setup@zram0 от генератора zram, и он иногда успевает раньше:
+# тогда наш swapon отвечает «Device or resource busy», служба падает, а
+# система уходит в degraded — хотя своп работает и стоит с нужным приоритетом.
+# Поэтому: пробуем включить, молча терпим отказ и проверяем, что своп на месте.
+ExecStart=/bin/sh -c 'swapon --priority 100 /dev/zram0 2>/dev/null; grep -q /dev/zram0 /proc/swaps'
+ExecStop=/bin/sh -c 'grep -q /dev/zram0 /proc/swaps && swapoff /dev/zram0 || true'
+
+[Install]
+WantedBy=sysinit.target

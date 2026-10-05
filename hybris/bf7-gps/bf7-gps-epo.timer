@@ -1,0 +1,10 @@
+[Unit]
+Description=GPS BF7: обновлять EPO раз в 6 часов (качает, если файлу больше 20 ч)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

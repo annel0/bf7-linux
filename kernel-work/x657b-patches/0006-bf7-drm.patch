@@ -1,0 +1,237 @@
+From 9e8a1b2d3833138717bb5e0bcba1fb12309506e6 Mon Sep 17 00:00:00 2001
+From: bf7 <bf7@local>
+Date: Wed, 16 Sep 2026 17:18:16 +0300
+Subject: [PATCH 06/40] =?UTF-8?q?bf7=20drm:=20=D0=BF=D0=BE=D0=BA=D0=B0?=
+ =?UTF-8?q?=D0=B7=D1=8B=D0=B2=D0=B0=D1=82=D1=8C=20=D0=BF=D0=B5=D1=80=D0=B2?=
+ =?UTF-8?q?=D1=8B=D0=B9=20=D0=BA=D0=B0=D0=B4=D1=80=20=D0=BF=D1=80=D0=B8=20?=
+ =?UTF-8?q?=D0=B2=D0=BA=D0=BB=D1=8E=D1=87=D0=B5=D0=BD=D0=B8=D0=B8=20=D0=BA?=
+ =?UTF-8?q?=D0=BE=D0=BD=D0=B2=D0=B5=D0=B9=D0=B5=D1=80=D0=B0=20=D0=B8=20?=
+ =?UTF-8?q?=D0=B2=D1=8B=D1=80=D0=BE=D0=B2=D0=BD=D1=8F=D1=82=D1=8C=20=D0=B1?=
+ =?UTF-8?q?=D1=83=D1=84=D0=B5=D1=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Две правки по итогам первого запуска на железе.
+
+1. Размер буфера вывода обязан быть кратен странице. m4u_map_sgtable()
+   проверяет это и отвечает -EINVAL с сообщением unaligned, причём сам MVA
+   к этому моменту уже выделен — ошибка выглядит запутанно.
+
+2. Первый кадр показывает обработчик включения конвейера.
+   tinydrm_display_pipe_update() зовётся только при СМЕНЕ буфера, а при
+   установке режима меняется состояние конвейера, а не буфер. Без этого
+   drmModeSetCrtc проходил успешно, но на панель не попадало ничего.
+
+Проверено на устройстве: карта card1 с соединителем card1-DSI-1 в состоянии
+connected, режим 720x1612, клиент создаёт dumb-буфер, ставит режим, и ядро
+сообщает: первый кадр показан (слой 0, MVA 0x41400000). Ошибок от
+вендорского тракта нет.
+---
+ .../mediatek/video/mt6765/videox/bf7_drm.c    | 101 +++++++++++++++---
+ 1 file changed, 88 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+index 619f64d55..04d1f9051 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+@@ -29,6 +29,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/dma-mapping.h>
++#include <linux/of_device.h>
+ 
+ #include <drm/drmP.h>
+ #include <drm/drm_atomic_helper.h>
+@@ -129,8 +130,18 @@ static int bf7_post_frame(struct bf7_drm_device *bf7)
+ 	}
+ 
+ 	ret = primary_display_trigger(1 /* блокирующий */, NULL, 0);
+-	if (ret)
++	if (ret) {
+ 		DRM_ERROR("bf7: запуск кадра отказал: %d\n", ret);
++	} else {
++		static bool first = true;
++
++		/* Один раз сообщаем, что кадр реально ушёл в панель. */
++		if (first) {
++			first = false;
++			DRM_INFO("bf7: первый кадр показан (слой %u, MVA 0x%x)\n",
++				 in->layer_id, bf7->scanout_mva);
++		}
++	}
+ out:
+ 	kfree(cfg);
+ 	return ret;
+@@ -148,12 +159,21 @@ static int bf7_alloc_scanout(struct device *dev, struct bf7_drm_device *bf7)
+ 
+ 	/* Выравнивание строки такое же, как у вендорского кода. */
+ 	bf7->pitch_px = ALIGN_TO(bf7->mode.hdisplay, MTK_FB_ALIGNMENT);
+-	bf7->scanout_size = (size_t)bf7->pitch_px * bf7->mode.vdisplay * 4;
++	/*
++	 * Размер обязательно кратен странице: m4u_map_sgtable() проверяет это
++	 * и отвечает -EINVAL с сообщением «unaligned». Сам MVA при этом уже
++	 * выделен, так что ошибка выглядит запутанно.
++	 */
++	bf7->scanout_size = PAGE_ALIGN((size_t)bf7->pitch_px *
++				       bf7->mode.vdisplay * 4);
+ 
+ 	bf7->scanout_va = dma_alloc_wc(dev, bf7->scanout_size,
+ 				       &bf7->scanout_pa, GFP_KERNEL);
+-	if (!bf7->scanout_va)
++	if (!bf7->scanout_va) {
++		dev_err(dev, "не выделить буфер вывода на %zu байт\n",
++			bf7->scanout_size);
+ 		return -ENOMEM;
++	}
+ 
+ 	memset(bf7->scanout_va, 0, bf7->scanout_size);
+ 
+@@ -164,24 +184,39 @@ static int bf7_alloc_scanout(struct device *dev, struct bf7_drm_device *bf7)
+ 	}
+ 
+ 	ret = sg_alloc_table(&bf7->sgt, 1, GFP_KERNEL);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "sg_alloc_table отказал: %d\n", ret);
+ 		goto err_free;
++	}
+ 
+ 	sg_dma_address(bf7->sgt.sgl) = bf7->scanout_pa;
+ 	sg_dma_len(bf7->sgt.sgl) = bf7->scanout_size;
+ 
+ 	bf7->m4u_client = m4u_create_client();
+ 	if (IS_ERR_OR_NULL(bf7->m4u_client)) {
++		dev_err(dev, "m4u_create_client отказал\n");
+ 		ret = -ENODEV;
+ 		goto err_sgt;
+ 	}
+ 
+-	mva = (unsigned int)(bf7->scanout_pa & 0xffffffffULL);
++	/*
++	 * MVA не назначаем, а просим M4U выбрать сам.
++	 *
++	 * mtkfb требует MVA == PA, но у него на то причина: адрес фреймбуфера
++	 * достался от загрузчика и должен остаться прежним. Наш буфер приходит
++	 * из общего пула (проверено: PA 0xff200000), и требование конкретного
++	 * адреса M4U отвергает с -EINVAL.
++	 */
++	mva = 0;
+ 	ret = m4u_alloc_mva(bf7->m4u_client, M4U_PORT_DISP_OVL0, 0,
+ 			    &bf7->sgt, bf7->scanout_size,
+ 			    M4U_PROT_READ | M4U_PROT_WRITE, 0, &mva);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "m4u_alloc_mva отказал: %d (PA 0x%pa)\n",
++			ret, &bf7->scanout_pa);
++		ret = ret > 0 ? -EIO : ret;
+ 		goto err_client;
++	}
+ 
+ 	bf7->scanout_mva = mva;
+ 	dev_info(dev, "буфер вывода: %zu байт, PA 0x%pa, MVA 0x%x\n",
+@@ -246,6 +281,11 @@ static int bf7_fb_dirty(struct drm_framebuffer *fb,
+ 	return ret;
+ }
+ 
++static int bf7_fb_dirty(struct drm_framebuffer *fb,
++			struct drm_file *file_priv, unsigned int flags,
++			unsigned int color, struct drm_clip_rect *clips,
++			unsigned int num_clips);
++
+ static const struct drm_framebuffer_funcs bf7_fb_funcs = {
+ 	.destroy	= drm_gem_fb_destroy,
+ 	.create_handle	= drm_gem_fb_create_handle,
+@@ -261,6 +301,15 @@ static void bf7_pipe_enable(struct drm_simple_display_pipe *pipe,
+ 
+ 	DRM_DEBUG_KMS("bf7: включение конвейера\n");
+ 	bf7->enabled = true;
++
++	/*
++	 * Первый кадр обязан показать сам обработчик включения.
++	 * tinydrm_display_pipe_update() зовётся только при СМЕНЕ буфера, а при
++	 * установке режима меняется не буфер, а состояние конвейера — и без
++	 * этого вызова на экран не попадает ничего.
++	 */
++	if (plane_state && plane_state->fb)
++		bf7_fb_dirty(plane_state->fb, NULL, 0, 0, NULL, 0);
+ }
+ 
+ static void bf7_pipe_disable(struct drm_simple_display_pipe *pipe)
+@@ -306,10 +355,28 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ 	unsigned int w, h;
+ 	int ret;
+ 
+-	/* Буферы CMA адресуются 32 битами — этого дисплею достаточно. */
++	/*
++	 * Устройство мы завели сами, узла в device tree у него нет, поэтому
++	 * операции DMA ему никто не назначил и dma_coerce_mask_and_coherent()
++	 * отвечает -EIO. Назначаем их принудительно.
++	 */
++	of_dma_configure(dev, NULL, true);
++
++	/*
++	 * Слой DMA ругается «DMA mask not set», если указатель на маску не
++	 * заполнен. У устройства, заведённого вручную, его нет.
++	 */
++	if (!dev->dma_mask)
++		dev->dma_mask = &dev->coherent_dma_mask;
++
+ 	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
+-	if (ret)
+-		return ret;
++	if (ret) {
++		/*
++		 * Не смертельно: выделение всё равно может пройти. Ругаемся и
++		 * идём дальше, иначе диагностировать нечего.
++		 */
++		dev_warn(dev, "маска DMA не принята (%d), продолжаю\n", ret);
++	}
+ 
+ 	bf7 = devm_kzalloc(dev, sizeof(*bf7), GFP_KERNEL);
+ 	if (!bf7)
+@@ -345,13 +412,17 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ 		bf7->mode.vtotal = h;
+ 
+ 	ret = bf7_alloc_scanout(dev, bf7);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "буфер вывода не готов: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	tdev = &bf7->tinydrm;
+ 	ret = devm_tinydrm_init(dev, tdev, &bf7_fb_funcs, &bf7_drm_driver);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "devm_tinydrm_init отказал: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	tdev->fb_dirty = bf7_fb_dirty;
+ 
+@@ -359,15 +430,19 @@ static int bf7_drm_probe(struct platform_device *pdev)
+ 					DRM_MODE_CONNECTOR_DSI,
+ 					bf7_formats, ARRAY_SIZE(bf7_formats),
+ 					&bf7->mode, 0);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "tinydrm_display_pipe_init отказал: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	drm_mode_config_reset(tdev->drm);
+ 	platform_set_drvdata(pdev, tdev);
+ 
+ 	ret = devm_tinydrm_register(tdev);
+-	if (ret)
++	if (ret) {
++		dev_err(dev, "devm_tinydrm_register отказал: %d\n", ret);
+ 		return ret;
++	}
+ 
+ 	dev_info(dev, "KMS поверх вендорского тракта: %ux%u\n", w, h);
+ 	return 0;
+-- 
+2.55.0
+

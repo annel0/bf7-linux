@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ночной свет
+Name[en]=Night Light
+Comment=Тёплый экран по вечерам (с 20:00 до 06:00)
+Exec=/usr/local/bin/bf7-nochnoj-svet --pereklyuchit
+Icon=night-light-symbolic
+Terminal=false
+Categories=Settings;
+StartupNotify=false
+X-Purism-FormFactor=Workstation;Mobile;

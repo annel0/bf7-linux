@@ -1,0 +1,115 @@
+--- a/debian/rules
++++ b/debian/rules
+@@ -53,9 +53,8 @@
+ 		--disable-builtinglslang \
+ 		--disable-builtinzlib \
+ 		--disable-oss \
+-		--disable-spirv_cross \
+ 		--disable-vg \
+-		--disable-vulkan \
++		--enable-vulkan \
+ 		--enable-dbus \
+ 		$(CONFIG_EXTRA_FLAGS)
+ 
+--- a/debian/changelog
++++ b/debian/changelog
+@@ -1,3 +1,23 @@
++retroarch (1.14.0+dfsg-1+bf7.3) unstable; urgency=medium
++
++  * Wayland: scale touch coordinates by buffer_scale like the pointer
++    (touch overlay was unusable at scale 2 on the BF7 panel).
++
++ -- bf7 <bf7@localhost>  Wed, 23 Sep 2026 23:30:00 +0300
++
++retroarch (1.14.0+dfsg-1+bf7.2) unstable; urgency=medium
++
++  * Wayland: stop the endless resize at buffer scale 2 (swapchain and
++    pipelines were recreated every frame in fullscreen on the BF7 panel).
++
++ -- bf7 <bf7@localhost>  Wed, 23 Sep 2026 22:47:00 +0300
++
++retroarch (1.14.0+dfsg-1+bf7.1) unstable; urgency=medium
++
++  * Build with the Vulkan video driver (BF7: PowerVR GE8300 through libhybris).
++
++ -- bf7 <bf7@localhost>  Wed, 23 Sep 2026 20:27:41 +0300
++
+ retroarch (1.14.0+dfsg-1) unstable; urgency=medium
+ 
+   * Team upload
+--- a/gfx/drivers_shader/slang_reflection.cpp
++++ b/gfx/drivers_shader/slang_reflection.cpp
+@@ -439,10 +439,10 @@
+       return false;
+    }
+ 
+-   uint32_t vertex_ubo    = vertex.uniform_buffers.empty() ? 0 : vertex.uniform_buffers[0].id;
+-   uint32_t fragment_ubo  = fragment.uniform_buffers.empty() ? 0 : fragment.uniform_buffers[0].id;
+-   uint32_t vertex_push   = vertex.push_constant_buffers.empty() ? 0 : vertex.push_constant_buffers[0].id;
+-   uint32_t fragment_push = fragment.push_constant_buffers.empty() ? 0 : fragment.push_constant_buffers[0].id;
++   uint32_t vertex_ubo    = vertex.uniform_buffers.empty() ? 0 : uint32_t(vertex.uniform_buffers[0].id);
++   uint32_t fragment_ubo  = fragment.uniform_buffers.empty() ? 0 : uint32_t(fragment.uniform_buffers[0].id);
++   uint32_t vertex_push   = vertex.push_constant_buffers.empty() ? 0 : uint32_t(vertex.push_constant_buffers[0].id);
++   uint32_t fragment_push = fragment.push_constant_buffers.empty() ? 0 : uint32_t(fragment.push_constant_buffers[0].id);
+ 
+    if (vertex_ubo &&
+          vertex_compiler.get_decoration(
+--- a/gfx/common/wayland_common.c
++++ b/gfx/common/wayland_common.c
+@@ -753,13 +753,21 @@
+ 
+    flush_wayland_fd(&wl->input);
+ 
+-   new_width  = *width  * wl->last_buffer_scale;
+-   new_height = *height * wl->last_buffer_scale;
++   /* BF7: *width/*height are already scaled, and so is what get_video_size
++    * returns (wl->width * buffer_scale). Multiplying *width by
++    * last_buffer_scale again made every frame look like a resize at
++    * buffer_scale 2: fullscreen on the phone panel recreated the swapchain
++    * and all pipelines each frame (15 fps, a core busy in the shader
++    * compiler). Compare the scaled sizes directly; a scale change alone
++    * still counts, so set_resize updates wl_surface_set_buffer_scale. */
++   new_width  = *width;
++   new_height = *height;
+ 
+    get_video_size(wl, &new_width, &new_height);
+ 
+-   if (     new_width  != *width  * wl->last_buffer_scale
+-         || new_height != *height * wl->last_buffer_scale)
++   if (     new_width  != *width
++         || new_height != *height
++         || wl->last_buffer_scale != wl->buffer_scale)
+    {
+       *width  = new_width;
+       *height = new_height;
+--- a/input/common/wayland_common.c
++++ b/input/common/wayland_common.c
+@@ -331,10 +331,13 @@
+          {
+             wl->active_touch_positions[wl->num_active_touches].active = true;
+             wl->active_touch_positions[wl->num_active_touches].id     = id;
++            /* BF7: surface coordinates are logical; like the pointer
++             * handlers, scale them to buffer pixels, or at buffer_scale 2
++             * every touch lands in the top-left quarter (overlay unusable). */
+             wl->active_touch_positions[wl->num_active_touches].x      = (unsigned)
+-               wl_fixed_to_int(x);
++               wl_fixed_to_int((wl_fixed_t)wl->buffer_scale * x);
+             wl->active_touch_positions[wl->num_active_touches].y      = (unsigned)
+-               wl_fixed_to_int(y);
++               wl_fixed_to_int((wl_fixed_t)wl->buffer_scale * y);
+             wl->num_active_touches++;
+             break;
+          }
+@@ -415,8 +418,10 @@
+       if (  wl->active_touch_positions[i].active &&
+             wl->active_touch_positions[i].id == id)
+       {
+-         wl->active_touch_positions[i].x = (unsigned) wl_fixed_to_int(x);
+-         wl->active_touch_positions[i].y = (unsigned) wl_fixed_to_int(y);
++         wl->active_touch_positions[i].x = (unsigned)
++            wl_fixed_to_int((wl_fixed_t)wl->buffer_scale * x);
++         wl->active_touch_positions[i].y = (unsigned)
++            wl_fixed_to_int((wl_fixed_t)wl->buffer_scale * y);
+       }
+    }
+ }

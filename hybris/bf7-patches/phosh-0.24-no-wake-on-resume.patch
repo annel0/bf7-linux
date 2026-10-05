@@ -1,0 +1,36 @@
+Description: Не зажигать экран при выходе из сна
+ При каждом пробуждении phosh слал WakeUpScreen и сбрасывал таймеры
+ простоя — и то и другое через gsd-power зажигает экран. Система
+ просыпается и без человека: контроллер топлива раз в десятки минут,
+ будильники RTC таймеров. Экран вспыхивал в кармане на весь тайм-аут
+ простоя. Пробуждение кнопкой питания отрабатывает phoc (событие нажатия,
+ разбудившего систему, доходит до него и включает вывод), будильники
+ зажигают экран сами (bf7-budilnik).
+Author: BF7
+Forwarded: not-needed
+Last-Update: 2026-09-23
+---
+--- a/src/screen-saver-manager.c	2023-02-01 21:36:08.000000000 +0300
++++ b/src/screen-saver-manager.c	2026-09-23 10:20:21.724013771 +0300
+@@ -272,12 +272,15 @@
+   if (suspending) {
+     phosh_lockscreen_manager_set_locked (self->lockscreen_manager, TRUE);
+   } else {
+-    PhoshIdleManager *idle_manager;
+-
+-    phosh_screen_saver_manager_wakeup_screen (self);
+-
+-    idle_manager = phosh_idle_manager_get_default ();
+-    phosh_idle_manager_reset_timers (idle_manager);
++    /* BF7: do not light the screen on resume. The system also wakes up for
++     * reasons nobody asked for (the fuel gauge every few tens of minutes,
++     * RTC alarms of timers) and the screen then lit up in the pocket for the
++     * whole idle delay. Resetting the idle timers is no better: gsd-power
++     * takes it as user activity and lights the screen itself. A wakeup by
++     * the power key is handled by phoc: the key event that woke the system
++     * reaches it and toggles the output on. Alarms light the screen on
++     * their own (bf7-budilnik). */
++    g_debug ("Resumed, leaving the screen as it is");
+   }
+ }
+ 

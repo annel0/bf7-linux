@@ -1,0 +1,33 @@
+[Unit]
+# BF7: поднять стоковый стек Wi-Fi MediaTek.
+#
+# Поднимается ПОСЛЕ графики, и это главное в этом файле.
+#
+# Замер загрузки показал: с 39-й по 65-ю секунду процессор занят почти целиком
+# — сначала insmod драйвера wlan (85–95%), потом нити mtk_wmtd и
+# mtk_wmtd_worker (вместе до 70%). Всё, что стартует в этом окне, стоит в
+# очереди за ними: alsa-restore, bf7-pulse, bf7-camera и bf7-touch-init
+# начинались в 39-ю секунду и заканчивались в 65-ю — все четыре разом.
+#
+# Экрану телефона ждать сеть незачем: пусть сеанс появится, а Wi-Fi догонит.
+# Доведением до подключения и так занимается bf7-wifi-watch.
+#
+# Type=simple, а не oneshot: скрипт пишет в /dev/wmtWifi, и эта запись
+# блокируется, пока драйвер не поднимет wlan0.
+Description=BF7 stock MediaTek Wi-Fi bootstrap
+DefaultDependencies=no
+# Порядок берём от сеанса, а не от цели. «WantedBy=graphical.target» вместе с
+# «After=graphical.target» — это кольцо: цель тянет службу, а служба ждёт цель,
+# и systemd молча выкидывает одно из заданий. Правильно ждать саму оболочку.
+After=local-fs.target sysinit.target bf7-phosh.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/bf7-wifi-init
+Restart=no
+TimeoutStartSec=90
+
+[Install]
+WantedBy=graphical.target

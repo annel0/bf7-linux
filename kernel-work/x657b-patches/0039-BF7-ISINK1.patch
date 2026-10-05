@@ -1,0 +1,57 @@
+From 28f76aa9511edf6ee99756971a2cb10348c4ef22 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 30 Sep 2026 14:48:40 +0300
+Subject: [PATCH 39/40] =?UTF-8?q?BF7:=20=D0=B8=D0=BD=D0=B2=D0=B5=D1=80?=
+ =?UTF-8?q?=D1=81=D0=B8=D1=8F=20ISINK1=20=D0=BF=D0=BE=D1=80=D0=BE=D0=B3?=
+ =?UTF-8?q?=D0=BE=D0=BC=20=E2=80=94=20=D0=BE=D0=B3=D0=BE=D0=BD=D1=91=D0=BA?=
+ =?UTF-8?q?=20=D0=B3=D0=BE=D1=80=D0=B8=D1=82=20=D0=BF=D1=80=D0=B8=20=D1=8F?=
+ =?UTF-8?q?=D1=80=D0=BA=D0=BE=D1=81=D1=82=D0=B8=20>=20=D0=BF=D0=BE=D0=BB?=
+ =?UTF-8?q?=D0=BE=D0=B2=D0=B8=D0=BD=D1=8B=20(=D0=BF=D1=80=D0=BE=D0=BC?=
+ =?UTF-8?q?=D0=B5=D0=B6=D1=83=D1=82=D0=BE=D1=87=D0=BD=D1=8B=D1=85=20=D1=81?=
+ =?UTF-8?q?=D1=82=D1=83=D0=BF=D0=B5=D0=BD=D0=B5=D0=B9=20=D1=83=20=D0=BD?=
+ =?UTF-8?q?=D0=B5=D0=B3=D0=BE=20=D0=BD=D0=B5=D1=82)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/leds/leds-mt6357.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/misc/mediatek/leds/leds-mt6357.c b/drivers/misc/mediatek/leds/leds-mt6357.c
+index 6a081e738..180aaab16 100644
+--- a/drivers/misc/mediatek/leds/leds-mt6357.c
++++ b/drivers/misc/mediatek/leds/leds-mt6357.c
+@@ -1108,8 +1108,9 @@ static int mt6357_led_hw_on(struct led_classdev *cdev,
+ /*
+  * BF7: огонёк уведомлений на ISINK1 включён наоборот — горит при яркости 0 и
+  * гаснет при любом включении ISINK1 (камера, 2026-09-23 и 2026-09-30). В покое
+- * он светится постоянно, а мигание feedbackd не видно. С bf7_invert_isink1=1 в
+- * железо уходит max − яркость: в покое тёмный, при уведомлении вспыхивает.
++ * он светится постоянно, а мигание feedbackd не видно. С bf7_invert_isink1=1
++ * огонёк горит, когда запрошено больше половины яркости: в покое тёмный, при
++ * уведомлении вспыхивает.
+  * По умолчанию выключено, пока не подтверждено без кабеля. Включить:
+  *   echo 1 > /sys/module/leds_mt6357/parameters/bf7_invert_isink1
+  * (новое значение применяется со следующей записи яркости).
+@@ -1125,8 +1126,15 @@ static void mt6357_led_set_brightness(struct led_classdev *cdev,
+ 	struct mt6357_leds *leds = led->parent;
+ 	int ret;
+ 
++	/*
++	 * Промежуточной яркости у огонька нет: он горит, только когда ISINK1
++	 * выключен совсем. Поэтому не max − b, а порог: запрошено больше
++	 * половины — ISINK1 выключен (огонёк горит), иначе включён. Плавная
++	 * «пульсация» feedbackd превращается в чёткие вспышки на пол-периода
++	 * (при max − b огонёк вспыхивал лишь на ~50 мс вершины).
++	 */
+ 	if (bf7_invert_isink1 && led->id == MT6357_ISINK1)
+-		brightness = cdev->max_brightness - brightness;
++		brightness = brightness > cdev->max_brightness / 2 ? 0 : cdev->max_brightness;
+ 
+ 	mutex_lock(&leds->lock);
+ 
+-- 
+2.55.0
+

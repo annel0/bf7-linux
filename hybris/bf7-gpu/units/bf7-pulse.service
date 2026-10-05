@@ -1,0 +1,27 @@
+[Unit]
+# BF7: звуковой сервер.
+#
+# Держит устройство открытым постоянно — этим и живёт аналоговый путь кодека
+# (см. /usr/local/bin/bf7-audio-up). Ключи кодека поднимает отдельная служба
+# bf7-audio, когда сервер уже готов.
+#
+# Type=notify: PulseAudio сам сообщает systemd о готовности (READY=1), так
+# же устроена и его штатная пользовательская служба. Раньше тут было
+# Type=simple плюс ExecStartPost «sleep 4; bf7-audio-up»: сервер считался
+# запущенным только через 11 с, а телефонный сеанс стоит после него
+# (Before= ниже) — экран появлялся на эти 11 с позже, и bf7-audio-up при
+# этом выполнялся дважды (здесь и в bf7-audio.service). Замер 2026-09-23.
+Description=Звуковой сервер BF7 (PulseAudio)
+Before=bf7-session.service bf7-phosh.service
+
+[Service]
+Type=notify
+RuntimeDirectory=bf7-pulse
+RuntimeDirectoryMode=0755
+Environment=PULSE_RUNTIME_PATH=/run/bf7-pulse
+ExecStart=/usr/bin/pulseaudio --daemonize=no --disallow-exit --exit-idle-time=-1 -n -F /etc/pulse/bf7.pa
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

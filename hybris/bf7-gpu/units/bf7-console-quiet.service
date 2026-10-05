@@ -1,0 +1,22 @@
+[Unit]
+# BF7: утихомирить консоль после загрузки.
+#
+# С 2026-09-23 основной образ грузится с quiet (native-linux-build/
+# alps191-rootfs-v1/build.sh), и эта служба почти ничего не меняет. Она
+# остаётся на случай подробного образа (BF7_PODROBNO=1): там ignore_loglevel
+# гонит каждое сообщение ядра в три консоли, включая UART на 921600.
+Description=BF7: quiet the framebuffer console once boot is done
+Documentation=man:printk(1)
+After=getty@tty1.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The cmdline keeps ignore_loglevel on so the whole boot log reaches the panel;
+# drop it once there is a login prompt, otherwise the wlan driver alone pushes
+# ~40 informational lines a second and nothing on screen stays readable.
+ExecStart=/bin/sh -c "echo N > /sys/module/printk/parameters/ignore_loglevel"
+ExecStart=/sbin/sysctl -q -w kernel.printk=4
+
+[Install]
+WantedBy=multi-user.target

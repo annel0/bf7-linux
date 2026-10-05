@@ -1,0 +1,100 @@
+# Настройки по умолчанию для сеанса BF7.
+#
+# Зачем системная база, а не «gsettings set» руками: она действует на любой
+# сеанс и не требует шины, так что переживает переустановку и чужого хозяина.
+# Пользовательская база всё равно главнее, так что хозяин может переставить.
+
+[org/gnome/settings-daemon/plugins/power]
+# Автояркость (хозяин попросил 2026-09-25). Датчик mn78911, bf7-sensor-proxy
+# отдаёт gsd не люксы, а √лк + 2 (среднее двенадцати замеров за 3 с) — на сырых
+# люксах линейная шкала gsd уводила подсветку почти в ноль, когда телефон брали
+# в руку. (Здесь ниже долго стояла вторая строка ambient-enabled=false «датчика
+# нет» — последняя побеждает, и без пользовательской базы автояркость была бы
+# выключена; убрана 2026-09-30.)
+ambient-enabled=true
+# Затемнение перед гашением. Было выключено: каждое изменение яркости поднимает
+# gsd-backlight-helper через pkexec, и за десять минут набегало восемь зомби —
+# GLib ждала их через waitid(P_PIDFD), которого в ядре 4.19 не было. С ядра v6
+# (перенос P_PIDFD) зомби нет, затемнение включено снова 2026-09-30.
+idle-dim=true
+# Автосон. Сон s2idle работает (2026-09-23): gsd-power по простою → logind →
+# systemd (SuspendState=freeze). Будят будильники RTC и контроллер топлива
+# (проверено), кнопка питания (у неё wakeup-source в дереве устройств, то же
+# прерывание PMIC); после непрошеного пробуждения gsd усыпляет снова.
+# На батарее — через 10 минут простоя (экран гаснет через 2): 20 минут GNOME
+# для телефона долго, а мгновенный сон как в Android обрывал бы загрузки и
+# проигрыватели, не берущие запрет на сон. На кабеле не спим никогда: это
+# зарядка и канал отладки по USB.
+sleep-inactive-battery-type='suspend'
+sleep-inactive-battery-timeout=600
+sleep-inactive-ac-type='nothing'
+
+[org/gnome/settings-daemon/plugins/color]
+# Ночной свет: расписание вручную — автоматическое берёт закат по координатам,
+# а геолокация для root закрыта, и оно не сработало бы никогда. Сам ночной
+# свет выключен; включает его хозяин записью «Ночной свет» в сетке
+# (bf7-nochnoj-svet --pereklyuchit).
+night-light-schedule-automatic=false
+night-light-schedule-from=20.0
+night-light-schedule-to=6.0
+
+[sm/puri/phosh/plugins]
+# Экран блокировки: свайп слева направо открывает ближайшие события из
+# Календаря (плагин phosh upcoming-events; проверено камерой 2026-09-30).
+# Читается только при запуске phosh.
+lock-screen=['upcoming-events']
+
+[org/gnome/desktop/interface]
+# Заряд в процентах рядом со значком батареи (phosh 0.24 этот ключ знает;
+# в строке состояния помещается — камерой 2026-09-30).
+show-battery-percentage=true
+
+[org/gnome/epiphany]
+# Список правил блокировщика — местный файл вместо сетевого адреса.
+#
+# Стоит это дорого: пока список не готов, Epiphany откладывает КАЖДОЕ решение
+# о переходе (decide_policy_cb в src/ephy-window.c кладёт запрос в очередь и
+# ждёт «notify::is-initialized»). А заводской адрес
+# easylist-downloads.adblockplus.org с телефона недоступен — TCP открывается
+# мгновенно, но рукопожатие TLS истекает по сроку. Значит список не готов
+# никогда, и браузер не показывает НИ ОДНОЙ страницы, даже своей внутренней.
+#
+# Сам файл кладёт hybris/bf7-gpu/bf7-adblock-obnovit.sh с хозяйской машины.
+content-filters=['file:///usr/local/share/bf7/easylist_min_content_blocker.json']
+
+[org/gnome/desktop/background]
+# Обои под экран 720×1612 в JPEG (hybris/bf7-gpu/fon): пакетные — WebP
+# 4096×4096, а загрузчика WebP нет, и phosh показывал голый синий фон.
+# phosh 0.24 берёт только picture-uri и не знает picture-uri-dark, а тема у
+# нас тёмная (prefer-dark) — поэтому и в picture-uri тёмный вариант.
+picture-uri='file:///usr/local/share/backgrounds/bf7/adwaita-d-720x1612.jpg'
+picture-uri-dark='file:///usr/local/share/backgrounds/bf7/adwaita-d-720x1612.jpg'
+
+# Избранное Phosh. Браузер — именно bf7-web.desktop: родная запись Epiphany
+# спрятана (NoDisplay, см. org.gnome.Epiphany.desktop), а сетка не повторяет
+# избранное только при совпадении идентификатора — с родной записью в
+# избранном в сетке стояли два одинаковых глобуса.
+[sm/puri/phosh]
+favorites=['bf7-web.desktop', 'org.gnome.Console.desktop', 'org.gnome.Calculator.desktop', 'org.gnome.clocks.desktop']
+# Календарь 43 в узком окне раскладывается сам (месяц сверху, список ниже —
+# проверено камерой 2026-09-30), но в .desktop не помечен мобильным и без
+# этого списка в основную сетку не попадает. Текстовый редактор 43 (libadwaita)
+# тоже умещается в узкое окно — проверено камерой, клавиатура всплывает.
+force-adaptive=['org.gnome.Calendar.desktop', 'org.gnome.TextEditor.desktop']
+
+# Просмотр снимков (eog). Боковая панель «Свойства» по умолчанию включена и
+# на экране 360 точек съедала почти всю ширину — снимок сжимался до 3%.
+[org/gnome/eog/ui]
+sidebar=false
+image-gallery=false
+
+# Раскладка по умолчанию — русская: экранная клавиатура (squeekboard)
+# показывает первую из списка, а стояла английская (2026-09-25). Английская —
+# на кнопке с глобусом.
+[org/gnome/desktop/input-sources]
+sources=[('xkb', 'ru'), ('xkb', 'us')]
+
+[org/gnome/Contacts]
+# Первый запуск «Контактов» спрашивал основную адресную книгу, а выбор там
+# один — локальная (её и берёт по умолчанию evolution-data-server).
+did-initial-setup=true

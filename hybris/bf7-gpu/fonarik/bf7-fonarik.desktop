@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Фонарик
+Name[en]=Flashlight
+Comment=Светодиод вспышки как фонарь
+Comment[en]=Use the camera flash LED as a flashlight
+Exec=/usr/local/bin/bf7-fonarik-app
+StartupNotify=true
+StartupWMClass=org.bf7.Fonarik
+Icon=bf7-fonarik
+Terminal=false
+Categories=Utility;
+Keywords=фонарь;фонарик;свет;flashlight;torch;
+X-Purism-FormFactor=Workstation;Mobile;

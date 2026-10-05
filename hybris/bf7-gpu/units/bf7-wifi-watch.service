@@ -1,0 +1,29 @@
+[Unit]
+# BF7: довести Wi-Fi до подключения после загрузки.
+# Подробности — в /usr/local/sbin/bf7-wifi-watch. Коротко: NetworkManager
+# сдаётся после пяти отказов посредника и больше не пробует, а драйвер MTK к
+# началу загрузки ещё не готов.
+#
+# Type=simple здесь обязателен. С Type=oneshot служба числится «запускающейся»,
+# пока скрипт не вернётся, а он ждёт подключения до TimeoutStartSec=400. Всё
+# это время multi-user.target не считается достигнутой, и за ней стоят в
+# очереди графический сеанс, кнопка питания и вибромотор. Телефон загружался
+# четыре с лишним минуты и всё это время показывал чёрный экран — не потому,
+# что графика медленная, а потому, что она ждала Wi-Fi.
+#
+# Цель — graphical.target, а не multi-user: сам подъём драйвера (bf7-wifi)
+# перенесён за сеанс, чтобы экран не ждал сеть. Если оставить сторожа в
+# multi-user, получится кольцо через graphical.target, и systemd молча
+# выкинет одно из заданий.
+Description=Доведение Wi-Fi BF7 до подключения
+After=NetworkManager.service bf7-wifi.service
+Wants=NetworkManager.service bf7-wifi.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/bf7-wifi-watch
+# Скрипт сам завершается, когда добился подключения; успех — это выход с нулём.
+Restart=no
+
+[Install]
+WantedBy=graphical.target

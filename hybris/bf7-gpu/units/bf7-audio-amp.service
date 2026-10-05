@@ -1,0 +1,18 @@
+[Unit]
+# BF7: внешний усилитель звука.
+#
+# Отдельная служба, потому что она живёт постоянно: отпустить вывод включения
+# значит замолчать. Идёт после звукового сервера — тот уже держит поток, и
+# ключи кодека принимаются. Подробности — в /usr/local/bin/bf7-audio-amp.
+Description=Внешний усилитель звука BF7
+After=bf7-pulse.service bf7-audio.service
+Wants=bf7-pulse.service
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/bf7-audio-amp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

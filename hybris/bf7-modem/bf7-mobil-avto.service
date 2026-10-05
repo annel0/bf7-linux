@@ -1,0 +1,13 @@
+[Unit]
+Description=Мобильный интернет сам — только на разрешённой SIM (/etc/bf7/mobil-avto)
+After=ModemManager.service NetworkManager.service
+ConditionPathExists=/etc/bf7/mobil-avto
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/bf7-mobil-avto
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Камера
+Comment=Видоискатель, снимок и ночная съёмка
+Exec=/usr/local/bin/bf7-kamera
+Icon=camera-photo
+Terminal=false
+StartupNotify=true
+Categories=AudioVideo;Video;Graphics;Photography;
+Keywords=фото;снимок;camera;photo;
+X-Purism-FormFactor=Workstation;Mobile;

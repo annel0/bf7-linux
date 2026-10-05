@@ -1,0 +1,33 @@
+Description: Не включать панель при выходе из сна
+ gsd-power при каждом пробуждении делал backlight_enable() — «открыли
+ крышку, значит, хотят видеть экран». Телефон просыпается и без человека:
+ контроллер топлива раз в десятки минут, будильники RTC таймеров. Вместе с
+ такой же правкой phosh (phosh-0.24-no-wake-on-resume.patch) экран после
+ непрошеного пробуждения остаётся тёмным (проверено камерой 2026-09-23).
+ Кнопку питания отрабатывает phoc, нажатие — действие пользователя, gsd
+ сам выходит из простоя и включает панель; будильник зажигает экран так же
+ (bf7-budilnik), bf7-dosyp усыпляет обратно.
+Author: BF7
+Forwarded: not-needed
+Last-Update: 2026-09-23
+---
+--- a/plugins/power/gsd-power-manager.c	2022-09-18 00:37:19.000000000 +0300
++++ b/plugins/power/gsd-power-manager.c	2026-09-23 10:40:23.479287913 +0300
+@@ -2777,8 +2777,15 @@
+ static void
+ handle_resume_actions (GsdPowerManager *manager)
+ {
+-        /* ensure we turn the panel back on after resume */
+-        backlight_enable (manager);
++        /* BF7: do not turn the panel back on after resume. That is laptop
++         * logic (the lid was opened, a key was pressed). A phone also wakes
++         * up with nobody around: the fuel gauge every few tens of minutes,
++         * RTC alarms of timers, and the screen lit up in the pocket. A wakeup
++         * by the power key reaches phoc, which toggles the output on; that
++         * key press is user activity, so gsd leaves idle and turns the panel
++         * on itself. Alarms light the screen with a key press too
++         * (bf7-budilnik), and bf7-dosyp puts the phone back to sleep after a
++         * wakeup nobody asked for. */
+ 
+         /* set up the delay again */
+         inhibit_suspend (manager);

@@ -1,0 +1,6 @@
+# BF7: звук разговора даёт bf7-zvonki, а не пакетный callaudiod (см. сам
+# скрипт). Лежит в /usr/local/share/dbus-1/services — этот каталог в
+# XDG_DATA_DIRS сеанса раньше /usr/share и перекрывает пакетный файл.
+[D-BUS Service]
+Name=org.mobian_project.CallAudio
+Exec=/usr/local/bin/bf7-zvonki

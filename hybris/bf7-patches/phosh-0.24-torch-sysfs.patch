@@ -1,0 +1,65 @@
+Description: torch: write brightness to sysfs when logind has no session
+ phosh sets the torch brightness via org.freedesktop.login1 session/auto.
+ On BF7 the shell is started by a systemd service, not by a login manager,
+ so there is no logind session and SetBrightness fails with UnknownObject:
+ the quick setting was present but did nothing. The shell runs as root, so
+ fall back to writing the LED's sysfs brightness attribute directly.
+Author: bf7
+Forwarded: no
+Last-Update: 2026-09-23
+---
+--- a/src/torch-manager.c	2026-09-23 15:36:36.513078836 +0300
++++ b/src/torch-manager.c	2026-09-23 15:36:49.473360451 +0300
+@@ -12,6 +12,9 @@
+ 
+ #include <gudev/gudev.h>
+ 
++#include <errno.h>
++#include <stdio.h>
++
+ #include "torch-manager.h"
+ #include "shell.h"
+ #include "util.h"
+@@ -53,6 +56,8 @@
+   int                    brightness;
+   int                    max_brightness;
+   int                    last_brightness;
++  /* BF7: запрошенная яркость — для записи в sysfs, если logind откажет */
++  int                    requested_brightness;
+ 
+   GUdevClient           *udev_client;
+   GUdevDevice           *udev_device;
+@@ -98,8 +103,23 @@
+   g_return_if_fail (PHOSH_DBUS_IS_LOGIN_SESSION (proxy));
+ 
+   if (!phosh_dbus_login_session_call_set_brightness_finish (proxy, res, &err)) {
+-    g_warning ("Failed to set torch brigthness: %s", err->message);
+-    return;
++    /*
++     * BF7: у оболочки нет сеанса logind (её запускает служба systemd, а не
++     * менеджер входа), и SetBrightness на session/auto отвечает «Unknown
++     * object». Оболочка работает от root — пишем яркость в sysfs сами.
++     */
++    g_autofree char *path = NULL;
++    FILE *f;
++
++    path = g_build_filename (g_udev_device_get_sysfs_path (self->udev_device),
++                             "brightness", NULL);
++    f = fopen (path, "w");
++    if (!f || fprintf (f, "%d", self->requested_brightness) < 0 || fclose (f) != 0) {
++      g_warning ("Failed to set torch brigthness: %s; %s: %s", err->message,
++                 path, g_strerror (errno));
++      return;
++    }
++    g_debug ("Torch brightness %d set via %s", self->requested_brightness, path);
+   }
+ 
+   apply_brightness (self);
+@@ -115,6 +135,7 @@
+     return;
+ 
+   g_debug("Setting brightness to %d", brightness);
++  self->requested_brightness = brightness;
+ 
+   phosh_dbus_login_session_call_set_brightness (self->proxy,
+                                                 TORCH_SUBSYSTEM,

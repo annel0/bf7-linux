@@ -1,0 +1,150 @@
+Index: phoc-pkg/src/desktop.c
+===================================================================
+--- a/src/desktop.c	2023-01-31 14:36:25.000000000 +0300
++++ b/src/desktop.c	2026-09-23 21:44:23.295790535 +0300
+@@ -15,6 +15,8 @@
+ #include <wlr/types/wlr_gamma_control_v1.h>
+ #include <wlr/types/wlr_primary_selection_v1.h>
+ #include <wlr/types/wlr_idle.h>
++#include <wlr/types/wlr_idle_inhibit_v1.h>
++#include <wlr/types/wlr_surface.h>
+ #include <wlr/types/wlr_input_inhibitor.h>
+ #include <wlr/types/wlr_layer_shell_v1.h>
+ #include <wlr/types/wlr_output_layout.h>
+@@ -306,6 +308,100 @@
+ 	return NULL;
+ }
+ 
++/*
++ * BF7: zwp_idle_inhibit_manager_v1. phoc 0.24 его не объявлял, и программы,
++ * которые держат экран только им (RetroArch, mpv, SDL-игры), гасли посреди
++ * игры или фильма. Запрет действует, пока окно, попросившее его, видно:
++ * фоновая программа не должна держать экран включённым. Видимость меняется
++ * и без сигналов, на которые мы подписаны (переключение окон), поэтому, пока
++ * запреты есть, раз в 5 с перепроверяем.
++ */
++typedef struct {
++  PhocDesktop *desktop;
++  struct wlr_idle_inhibitor_v1 *wlr_inhibitor;
++  struct wl_listener destroy;
++  struct wl_list link;
++} PhocIdleInhibitor;
++
++static gboolean
++idle_inhibitor_is_active (PhocIdleInhibitor *inhibitor)
++{
++  struct wlr_surface *root = wlr_surface_get_root_surface (inhibitor->wlr_inhibitor->surface);
++  PhocView *view = phoc_view_from_wlr_surface (root);
++
++  if (view)
++    return phoc_desktop_view_is_visible (inhibitor->desktop, view);
++
++  /* Не окно (например, слой оболочки): пока у поверхности есть кадр. */
++  return wlr_surface_has_buffer (root);
++}
++
++static gboolean idle_inhibit_check (gpointer data);
++
++static void
++idle_inhibit_update (PhocDesktop *self)
++{
++  PhocIdleInhibitor *inhibitor;
++  gboolean inhibited = FALSE;
++
++  wl_list_for_each (inhibitor, &self->idle_inhibitors, link) {
++    if (idle_inhibitor_is_active (inhibitor)) {
++      inhibited = TRUE;
++      break;
++    }
++  }
++
++  if (inhibited != self->idle_inhibited) {
++    self->idle_inhibited = inhibited;
++    wlr_idle_set_enabled (self->idle, NULL, !inhibited);
++    g_message ("Idle %s", inhibited ? "inhibited" : "no longer inhibited");
++  }
++
++  if (!wl_list_empty (&self->idle_inhibitors) && !self->idle_inhibit_check_id)
++    self->idle_inhibit_check_id = g_timeout_add_seconds (5, idle_inhibit_check, self);
++}
++
++static gboolean
++idle_inhibit_check (gpointer data)
++{
++  PhocDesktop *self = PHOC_DESKTOP (data);
++
++  if (wl_list_empty (&self->idle_inhibitors)) {
++    self->idle_inhibit_check_id = 0;
++    return G_SOURCE_REMOVE;
++  }
++  idle_inhibit_update (self);
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++handle_idle_inhibitor_destroy (struct wl_listener *listener, void *data)
++{
++  PhocIdleInhibitor *inhibitor = wl_container_of (listener, inhibitor, destroy);
++  PhocDesktop *self = inhibitor->desktop;
++
++  wl_list_remove (&inhibitor->link);
++  wl_list_remove (&inhibitor->destroy.link);
++  g_free (inhibitor);
++  idle_inhibit_update (self);
++}
++
++static void
++handle_idle_inhibitor_new (struct wl_listener *listener, void *data)
++{
++  PhocDesktop *self = wl_container_of (listener, self, idle_inhibit_new);
++  struct wlr_idle_inhibitor_v1 *wlr_inhibitor = data;
++  PhocIdleInhibitor *inhibitor = g_new0 (PhocIdleInhibitor, 1);
++
++  inhibitor->desktop = self;
++  inhibitor->wlr_inhibitor = wlr_inhibitor;
++  inhibitor->destroy.notify = handle_idle_inhibitor_destroy;
++  wl_signal_add (&wlr_inhibitor->events.destroy, &inhibitor->destroy);
++  wl_list_insert (&self->idle_inhibitors, &inhibitor->link);
++  idle_inhibit_update (self);
++}
++
++
+ gboolean
+ phoc_desktop_view_is_visible (PhocDesktop *desktop, PhocView *view)
+ {
+@@ -670,6 +766,10 @@
+   wlr_server_decoration_manager_set_default_mode(self->server_decoration_manager,
+ 						 WLR_SERVER_DECORATION_MANAGER_MODE_CLIENT);
+   self->idle = wlr_idle_create(server->wl_display);
++  self->idle_inhibit = wlr_idle_inhibit_v1_create (server->wl_display);
++  wl_list_init (&self->idle_inhibitors);
++  self->idle_inhibit_new.notify = handle_idle_inhibitor_new;
++  wl_signal_add (&self->idle_inhibit->events.new_inhibitor, &self->idle_inhibit_new);
+   self->primary_selection_device_manager =
+     wlr_primary_selection_v1_device_manager_create(server->wl_display);
+   self->input_inhibit =
+@@ -775,6 +875,8 @@
+   wl_list_remove (&self->input_inhibit_activate.link);
+   wl_list_remove (&self->input_inhibit_deactivate.link);
+   wl_list_remove (&self->virtual_keyboard_new.link);
++  wl_list_remove (&self->idle_inhibit_new.link);
++  g_clear_handle_id (&self->idle_inhibit_check_id, g_source_remove);
+   wl_list_remove (&self->virtual_pointer_new.link);
+   wl_list_remove (&self->pointer_constraint.link);
+   wl_list_remove (&self->output_manager_apply.link);
+Index: phoc-pkg/src/desktop.h
+===================================================================
+--- a/src/desktop.h	2023-01-31 14:36:25.000000000 +0300
++++ b/src/desktop.h	2026-09-23 21:44:23.295790535 +0300
+@@ -60,6 +60,11 @@
+ 	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
+ 	struct wlr_primary_selection_v1_device_manager *primary_selection_device_manager;
+ 	struct wlr_idle *idle;
++	struct wlr_idle_inhibit_manager_v1 *idle_inhibit; /* BF7 */
++	struct wl_listener idle_inhibit_new;
++	struct wl_list idle_inhibitors; // PhocIdleInhibitor::link
++	guint idle_inhibit_check_id;
++	gboolean idle_inhibited;
+ 	struct wlr_input_inhibit_manager *input_inhibit;
+ 	struct wlr_layer_shell_v1 *layer_shell;
+ 	struct wlr_input_method_manager_v2 *input_method;

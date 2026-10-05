@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- BF7: значок фонарика. Свет, голова, корпус с кнопкой. -->
+  <defs>
+    <linearGradient id="korpus" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#3d4450"/>
+      <stop offset="0.5" stop-color="#5b6473"/>
+      <stop offset="1" stop-color="#2f343d"/>
+    </linearGradient>
+    <linearGradient id="golova" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0" stop-color="#8d96a5"/>
+      <stop offset="0.5" stop-color="#c3cad5"/>
+      <stop offset="1" stop-color="#6f7887"/>
+    </linearGradient>
+    <radialGradient id="svet" cx="0.5" cy="1" r="0.9">
+      <stop offset="0" stop-color="#fff6c2" stop-opacity="0.95"/>
+      <stop offset="1" stop-color="#ffd84a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <path d="M40 46 L20 6 L108 6 L88 46 Z" fill="url(#svet)"/>
+  <path d="M38 44 H90 L82 62 H46 Z" fill="url(#golova)"/>
+  <rect x="38" y="41" width="52" height="6" rx="3" fill="#fff3b0"/>
+  <rect x="48" y="62" width="32" height="58" rx="6" fill="url(#korpus)"/>
+  <rect x="58" y="74" width="12" height="16" rx="4" fill="#ff8a3d"/>
+  <rect x="48" y="104" width="32" height="4" fill="#262a31"/>
+</svg>

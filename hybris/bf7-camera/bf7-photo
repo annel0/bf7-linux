@@ -1,0 +1,14 @@
+#!/bin/bash
+# Снять фотографию камерой телефона.
+#   bf7-photo [файл.jpg] [сколько кадров складывать]
+OUT=${1:-/root/фото/$(date +%Y%m%d-%H%M%S).jpg}
+N=${2:-4}
+mkdir -p "$(dirname "$OUT")"
+rm -f "$OUT"
+echo "фото $OUT $N" > /run/bf7-camd
+for i in $(seq 1 60); do
+    [ -s "$OUT" ] && { sleep 0.3; ls -la "$OUT"; exit 0; }
+    sleep 0.5
+done
+echo "не дождался: $OUT" >&2
+exit 1

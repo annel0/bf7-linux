@@ -1,0 +1,35 @@
+[Unit]
+# BF7: GPS MediaTek — модуль ядра gps_drv и демон mnld из /vendor.
+#
+# gps_drv.ko собран из донора (kernel-work/bf7-gps) против нашего ядра и
+# лежит в /lib/modules/$(uname -r)/extra, как модули Wi-Fi. Грузится после
+# wmt_drv (bf7-wifi): без ядра связности символы mtk_wcn_* не найдутся.
+# Выгружать нельзя — rmmod модулей связности роняет или вешает ядро.
+#
+# mnld — андроидный ELF, идёт через /system/bin/linker64; свойства Android
+# ему отдаёт подложка bf7-gps-props.so (иначе не узнаёт чип и не открывает
+# /dev/stpgps). Сам приёмник mnld включает только по команде HAL, то есть
+# когда bf7-gps-nmea кого-то обслуживает; в покое демон спит.
+Description=GPS BF7 (gps_drv + mnld)
+After=bf7-wifi.service
+Wants=bf7-wifi.service
+# wmt_drv может загрузиться чуть позже — пара повторов; но модуль, собранный
+# под прежнее ядро, не встанет никогда, и крутиться вечно незачем.
+StartLimitIntervalSec=180
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# bf7-wifi — Type=simple: wmt_drv грузится уже после её «запуска». Ждём его
+# до минуты, иначе insmod сыплет «Unknown symbol mtk_wcn_*».
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do grep -q "^wmt_drv " /proc/modules && break; sleep 1; done; grep -q "^gps_drv " /proc/modules || insmod /lib/modules/$(uname -r)/extra/gps_drv.ko'
+ExecStartPre=/bin/mkdir -p /data/vendor/gps
+# LD_PRELOAD только для mnld, не через Environment=: подложка собрана под
+# bionic, и в ExecStartPre (glibc-овский /bin/sh) она валит запуск с кодом 127.
+ExecStart=/usr/bin/env LD_PRELOAD=/opt/bf7/gps/bf7-gps-props.so /vendor/bin/mnld
+StandardOutput=null
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

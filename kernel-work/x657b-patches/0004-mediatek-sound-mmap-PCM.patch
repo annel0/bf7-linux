@@ -1,0 +1,1135 @@
+From 51c7ad7c41d533a022acb194cc956e2fe452f8ab Mon Sep 17 00:00:00 2001
+From: bf7 <bf7@local>
+Date: Wed, 16 Sep 2026 09:47:08 +0300
+Subject: [PATCH 04/40] =?UTF-8?q?mediatek=20sound:=20=D0=BD=D0=B5=20=D1=80?=
+ =?UTF-8?q?=D0=BE=D0=BD=D1=8F=D1=82=D1=8C=20=D1=8F=D0=B4=D1=80=D0=BE=20?=
+ =?UTF-8?q?=D0=BF=D1=80=D0=B8=20mmap=20=D0=B1=D1=83=D1=84=D0=B5=D1=80?=
+ =?UTF-8?q?=D0=B0=20PCM?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Драйверы PCM в sound/soc/mediatek/common_int объявляют
+SNDRV_PCM_INFO_MMAP, но их обратный вызов .page возвращает
+virt_to_page(dummy_page[substream->stream]), а dummy_page[] объявлен
+статически и нигде не инициализируется. virt_to_page(NULL) даёт мусорный
+указатель, и get_page() по нему роняет ядро в snd_pcm_mmap_data_fault.
+
+Любое приложение, отобразившее буфер PCM, перезагружало телефон. В Android
+не проявлялось: его звуковой HAL пишет через .copy_user. Firefox
+(библиотека cubeb) отображает — и валит систему за секунды.
+
+Снимаем SNDRV_PCM_INFO_MMAP и SNDRV_PCM_INFO_MMAP_VALID: ALSA откажет в
+отображении, приложения перейдут на обычную запись, которая работает.
+Дополнительно .page возвращает NULL вместо мусора, чтобы даже при обходе
+проверки умирало приложение, а не ядро.
+---
+ .../mediatek/common_int/mtk-soc-pcm-bt-dai.c  | 14 ++++++++++++++
+ .../mediatek/common_int/mtk-soc-pcm-capture.c | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-capture2.c         | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-deep-buffer-dl.c   | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-dl1-awb.c | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-dl1-bt.c  | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-dl1-i2s0.c         | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-dl1-i2s0Dl1.c      | 19 ++++++++++++++++---
+ .../common_int/mtk-soc-pcm-dl1-scpspk.c       | 17 +++++++++++++++--
+ .../soc/mediatek/common_int/mtk-soc-pcm-dl1.c | 17 +++++++++++++++--
+ .../soc/mediatek/common_int/mtk-soc-pcm-dl2.c | 19 ++++++++++++++++---
+ .../mediatek/common_int/mtk-soc-pcm-dummy.c   | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-fm-i2s-awb.c       | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-fm-i2s.c  | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-fmtx.c    | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-hdmi.c    | 19 ++++++++++++++++---
+ .../common_int/mtk-soc-pcm-hp-impedance.c     | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-i2s0-awb.c         | 16 +++++++++++++++-
+ .../common_int/mtk-soc-pcm-i2s2-adc2.c        | 16 +++++++++++++++-
+ .../mediatek/common_int/mtk-soc-pcm-mod-dai.c | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-mrgrx-awb.c        | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-mrgrx.c   | 17 +++++++++++++++--
+ .../mediatek/common_int/mtk-soc-pcm-routing.c | 14 ++++++++++++++
+ .../common_int/mtk-soc-pcm-uldlloopback.c     | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-voice-md1-bt.c     | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-voice-md1.c        | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-voice-md2-bt.c     | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-voice-md2.c        | 17 +++++++++++++++--
+ .../common_int/mtk-soc-pcm-voice-scp.c        |  3 +--
+ .../common_int/mtk-soc-pcm-voice-ultra.c      |  3 +--
+ .../mtk-soc-pcm-voice-usb-echoref.c           |  3 +--
+ .../common_int/mtk-soc-pcm-voice-usb.c        |  3 +--
+ .../mediatek/common_int/mtk-soc-tdm-capture.c | 19 ++++++++++++++++---
+ 33 files changed, 441 insertions(+), 64 deletions(-)
+
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
+index 841a43794..a124ff349 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-bt-dai.c
+@@ -463,6 +463,20 @@ static struct page *
+ mtk_bt_dai_capture_pcm_page(struct snd_pcm_substream *substream,
+ 			    unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-capture.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-capture.c
+index 2e37bc070..83355211c 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-capture.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-capture.c
+@@ -222,8 +222,7 @@ static const struct snd_kcontrol_new Audio_snd_capture_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_capture_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID |
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME |
+ 		 SNDRV_PCM_INFO_NO_PERIOD_WAKEUP),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+@@ -537,6 +536,20 @@ static void *dummy_page[2];
+ static struct page *mtk_capture_pcm_page(struct snd_pcm_substream *substream,
+ 					 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-capture2.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-capture2.c
+index 3e0b3d7c8..f4724c87b 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-capture2.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-capture2.c
+@@ -59,8 +59,7 @@ static int mtk_capture2_pcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_capture2_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_capture2_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -337,6 +336,20 @@ static void *dummy_page[2];
+ static struct page *mtk_capture2_pcm_page(struct snd_pcm_substream *substream,
+ 					  unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-deep-buffer-dl.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-deep-buffer-dl.c
+index 2b8803466..c9714eb1c 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-deep-buffer-dl.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-deep-buffer-dl.c
+@@ -161,8 +161,7 @@ static const struct snd_kcontrol_new deep_buffer_dl_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_deep_buffer_dl_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -477,6 +476,20 @@ static struct page *mtk_deep_buffer_dl_page(struct snd_pcm_substream *substream,
+ 					    unsigned long offset)
+ {
+ 	pr_debug("%s\n", __func__);
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-awb.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-awb.c
+index 9a29808bd..f961c9e87 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-awb.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-awb.c
+@@ -66,8 +66,7 @@ static int mtk_afe_dl1_awb_component_probe(struct snd_soc_component *component);
+ #define MAX_MIDI_DEVICES
+ 
+ static struct snd_pcm_hardware mtk_dl1_awb_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -281,6 +280,20 @@ static struct page *
+ mtk_dl1_capture_pcm_page(struct snd_pcm_substream *substream,
+ 			 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-bt.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-bt.c
+index 1e6c71858..89071ca9b 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-bt.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-bt.c
+@@ -105,8 +105,7 @@ static int mtk_Dl1Bt_close(struct snd_pcm_substream *substream);
+ static int mtk_asoc_dl1bt_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_dl1bt_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -370,6 +369,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0.c
+index c1ac06cbf..4f85d4edb 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0.c
+@@ -403,8 +403,7 @@ static const struct snd_kcontrol_new Audio_snd_i2s0_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_i2s0_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = Dl1_MAX_BUFFER_SIZE,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -638,6 +637,20 @@ static void *dummy_page[2];
+ static struct page *mtk_i2s0_pcm_page(struct snd_pcm_substream *substream,
+ 				      unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0Dl1.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0Dl1.c
+index a0f1623ec..b905483ad 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0Dl1.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-i2s0Dl1.c
+@@ -146,9 +146,8 @@ static const struct snd_kcontrol_new Audio_snd_I2S0dl1_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_I2S0dl1_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_NO_PERIOD_WAKEUP |
+-		 SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME |
+-		 SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_NO_PERIOD_WAKEUP | SNDRV_PCM_INFO_INTERLEAVED |
++		 SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -498,6 +497,20 @@ static void *dummy_page[2];
+ static struct page *mtk_I2S0dl1_pcm_page(struct snd_pcm_substream *substream,
+ 					 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-scpspk.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-scpspk.c
+index c67b50dbc..3570550d5 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-scpspk.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1-scpspk.c
+@@ -237,8 +237,7 @@ static const struct snd_kcontrol_new Audio_snd_dl1spk_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_dl1spk_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -1009,6 +1008,20 @@ static void *dummy_page[2];
+ static struct page *mtk_dl1spk_pcm_page(struct snd_pcm_substream *substream,
+ 					unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+index edcd6b6fc..6374c2df1 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+@@ -118,8 +118,7 @@ static bool mPrepareDone;
+ #define USE_PERIODS_MAX 8192
+ 
+ static struct snd_pcm_hardware mtk_pcm_dl1_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -565,6 +564,20 @@ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ #if defined(DL1_DEBUG_LOG)
+ 	pr_debug("%s\n", __func__);
+ #endif
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
+index 7133b2381..220f76997 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl2.c
+@@ -136,9 +136,8 @@ static const struct snd_kcontrol_new fast_dl_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_dl2_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_NO_PERIOD_WAKEUP |
+-		 SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME |
+-		 SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_NO_PERIOD_WAKEUP | SNDRV_PCM_INFO_INTERLEAVED |
++		 SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -936,6 +935,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_dl2_page(struct snd_pcm_substream *substream,
+ 				     unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dummy.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dummy.c
+index 8e5b800c3..2ffece041 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dummy.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dummy.c
+@@ -56,8 +56,7 @@ static int mtk_dummypcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_dummy_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_dummy_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -121,6 +120,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s-awb.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s-awb.c
+index 0a2058208..beeecda0a 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s-awb.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s-awb.c
+@@ -63,8 +63,7 @@ static int mtk_fm_i2s_awb_pcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_fm_i2s_awb_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_mgrrx_awb_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -310,6 +309,20 @@ static struct page *
+ mtk_fm_i2s_capture_pcm_page(struct snd_pcm_substream *substream,
+ 			    unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s.c
+index 44734e1be..2dbcefba6 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-fm-i2s.c
+@@ -87,8 +87,7 @@ static const struct snd_kcontrol_new Audio_snd_fm_i2s_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_fm_i2s_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -320,6 +319,20 @@ static void *dummy_page[2];
+ static struct page *mtk_fm_i2s_pcm_page(struct snd_pcm_substream *substream,
+ 					unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-fmtx.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-fmtx.c
+index a5c157e5f..5df20bb96 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-fmtx.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-fmtx.c
+@@ -127,8 +127,7 @@ static const struct snd_kcontrol_new Audio_snd_fmtx_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_fmtx_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -382,6 +381,20 @@ static struct page *mtk_pcm_fmtx_page(struct snd_pcm_substream *substream,
+ #if defined(FMTX_DEBUG_LOG)
+ 	pr_debug("%s\n", __func__);
+ #endif
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
+index 054797c84..9d9b227f7 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-hdmi.c
+@@ -403,8 +403,7 @@ static const struct snd_kcontrol_new Audio_snd_hdmi_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_hdmi_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -612,7 +611,7 @@ static int mtk_pcm_hdmi_open(struct snd_pcm_substream *substream)
+ #endif
+ 	runtime->hw.info |= SNDRV_PCM_INFO_INTERLEAVED;
+ 	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
+-	runtime->hw.info |= SNDRV_PCM_INFO_MMAP_VALID;
++	/* BF7: отображение буфера отключено — оно роняло ядро, см. mtk_pcm_page(). */
+ 
+ 	EnableApll1(true);
+ 	EnableApll2(true);
+@@ -975,6 +974,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-hp-impedance.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-hp-impedance.c
+index 2c768a31d..90de5d1b3 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-hp-impedance.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-hp-impedance.c
+@@ -67,8 +67,7 @@ static int mtk_soc_pcm_hp_impedance_close(struct snd_pcm_substream *substream);
+ static int mtk_asoc_dhp_impedance_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_pcm_hp_impedance_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+@@ -263,6 +262,20 @@ static struct page *
+ mtk_pcm_hp_impedance_page(struct snd_pcm_substream *substream,
+ 			  unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s0-awb.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s0-awb.c
+index edec1d5e8..1664ac6bc 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s0-awb.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s0-awb.c
+@@ -213,7 +213,7 @@ static int mtk_i2s0_awb_pcm_open(struct snd_pcm_substream *substream)
+ 		runtime->rate, runtime->channels);
+ 	runtime->hw.info |= SNDRV_PCM_INFO_INTERLEAVED;
+ 	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
+-	runtime->hw.info |= SNDRV_PCM_INFO_MMAP_VALID;
++	/* BF7: отображение буфера отключено — оно роняло ядро, см. mtk_pcm_page(). */
+ 
+ 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE)
+ 		pr_info("SNDRV_PCM_STREAM_CAPTURE\n");
+@@ -284,6 +284,20 @@ static struct page *
+ mtk_i2s0_capture_pcm_page(struct snd_pcm_substream *substream,
+ 			  unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s2-adc2.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s2-adc2.c
+index 0d60265e2..0dd2f6694 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s2-adc2.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-i2s2-adc2.c
+@@ -194,7 +194,7 @@ static int mtk_i2s2_adc2_pcm_open(struct snd_pcm_substream *substream)
+ 
+ 	runtime->hw.info |= SNDRV_PCM_INFO_INTERLEAVED;
+ 	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
+-	runtime->hw.info |= SNDRV_PCM_INFO_MMAP_VALID;
++	/* BF7: отображение буфера отключено — оно роняло ядро, см. mtk_pcm_page(). */
+ 
+ 	if (ret < 0) {
+ 		pr_err("mtk_i2s2_adc2_pcm_close\n");
+@@ -260,6 +260,20 @@ static void *dummy_page[2];
+ static struct page *mtk_i2s2_adc2_pcm_page(struct snd_pcm_substream *substream,
+ 					   unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-mod-dai.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-mod-dai.c
+index 99bc72d4a..d9ba8dab0 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-mod-dai.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-mod-dai.c
+@@ -56,8 +56,7 @@ static int mtk_mod_dai_pcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_mod_dai_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_mod_dai_hardware = {
+-	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME |
+-		 SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -333,6 +332,20 @@ static void *dummy_page[2];
+ static struct page *mtk_mod_dai_pcm_page(struct snd_pcm_substream *substream,
+ 					 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx-awb.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx-awb.c
+index e0aa944df..e338f5512 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx-awb.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx-awb.c
+@@ -61,8 +61,7 @@ static int mtk_mrgrx_awb_pcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_mrgrx_awb_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_mgrrx_awb_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -282,6 +281,20 @@ static struct page *
+ mtk_mrgrx_capture_pcm_page(struct snd_pcm_substream *substream,
+ 			   unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx.c
+index f17e478df..3129a3e14 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-mrgrx.c
+@@ -121,8 +121,7 @@ static const struct snd_kcontrol_new Audio_snd_mrgrx_controls[] = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_mrgrx_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -351,6 +350,20 @@ static void *dummy_page[2];
+ static struct page *mtk_mrgrx_pcm_page(struct snd_pcm_substream *substream,
+ 				       unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-routing.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-routing.c
+index 4331793aa..98e5122b8 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-routing.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-routing.c
+@@ -893,6 +893,20 @@ static void *dummy_page[2];
+ static struct page *mtk_routing_pcm_page(struct snd_pcm_substream *substream,
+ 					 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-uldlloopback.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-uldlloopback.c
+index 69e692eae..e9db3f6cf 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-uldlloopback.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-uldlloopback.c
+@@ -186,8 +186,7 @@ static int mtk_uldlloopbackpcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_uldlloopback_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_uldlloopback_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -331,6 +330,20 @@ static void *dummy_page[2];
+ static struct page *mtk_uldlloopback_page(struct snd_pcm_substream *substream,
+ 					  unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1-bt.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1-bt.c
+index 0ddb8f19a..389536f70 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1-bt.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1-bt.c
+@@ -88,8 +88,7 @@ static struct snd_pcm_hw_constraint_list constraints_sample_rates = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -205,6 +204,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1.c
+index 4a8bedffe..6efa29588 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md1.c
+@@ -110,8 +110,7 @@ static struct snd_pcm_hw_constraint_list constraints_sample_rates = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -362,6 +361,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2-bt.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2-bt.c
+index dada28367..492713084 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2-bt.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2-bt.c
+@@ -88,8 +88,7 @@ static struct snd_pcm_hw_constraint_list constraints_sample_rates = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -206,6 +205,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2.c
+index 1acaddd9a..b64420c82 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-md2.c
+@@ -105,8 +105,7 @@ static struct snd_pcm_hw_constraint_list constraints_sample_rates = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_STD_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -239,6 +238,20 @@ static void *dummy_page[2];
+ static struct page *mtk_pcm_page(struct snd_pcm_substream *substream,
+ 				 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-scp.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-scp.c
+index 598754cf0..648d35578 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-scp.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-scp.c
+@@ -241,8 +241,7 @@ static const struct snd_kcontrol_new Audio_Scp_voice_controls[] = {
+ #define SPK_WAITCHECK_INTERVAL_MS      (2)
+ 
+ static struct snd_pcm_hardware mtk_scp_voice_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-ultra.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-ultra.c
+index 35e0766c9..007e98012 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-ultra.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-ultra.c
+@@ -103,8 +103,7 @@ static struct audio_digital_pcm Voice2IntPcm = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb-echoref.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb-echoref.c
+index 7bc15d3d0..847aff48b 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb-echoref.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb-echoref.c
+@@ -79,8 +79,7 @@ static int usb_mem_blk[2] = {Soc_Aud_Digital_Block_MEM_DL1,
+ 			     Soc_Aud_Digital_Block_MEM_AWB};
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb.c
+index 34a89b7c0..e5443737a 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-voice-usb.c
+@@ -116,8 +116,7 @@ static struct audio_digital_pcm Voice2IntPcm = {
+ };
+ 
+ static struct snd_pcm_hardware mtk_pcm_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_HIGH_USE_RATE,
+ 	.rate_min = SOC_HIGH_USE_RATE_MIN,
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-tdm-capture.c b/sound/soc/mediatek/common_int/mtk-soc-tdm-capture.c
+index 4d2a38a8e..342fb8b25 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-tdm-capture.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-tdm-capture.c
+@@ -74,8 +74,7 @@ static int mtk_capture_pcm_close(struct snd_pcm_substream *substream);
+ static int mtk_afe_capture_component_probe(struct snd_soc_component *component);
+ 
+ static struct snd_pcm_hardware mtk_capture_hardware = {
+-	.info = (SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_INTERLEAVED |
+-		 SNDRV_PCM_INFO_RESUME | SNDRV_PCM_INFO_MMAP_VALID),
++	.info = (SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_RESUME),
+ 	.formats = SND_SOC_ADV_MT_FMTS,
+ 	.rates = SOC_NORMAL_USE_RATE,
+ 	.rate_min = SOC_NORMAL_USE_RATE_MIN,
+@@ -295,7 +294,7 @@ static int mtk_capture_pcm_open(struct snd_pcm_substream *substream)
+ 		 runtime->rate, runtime->channels);
+ 	runtime->hw.info |= SNDRV_PCM_INFO_INTERLEAVED;
+ 	runtime->hw.info |= SNDRV_PCM_INFO_NONINTERLEAVED;
+-	runtime->hw.info |= SNDRV_PCM_INFO_MMAP_VALID;
++	/* BF7: отображение буфера отключено — оно роняло ядро, см. mtk_pcm_page(). */
+ 
+ 
+ 	if (ret < 0) {
+@@ -360,6 +359,20 @@ static void *dummy_page[2];
+ static struct page *mtk_capture_pcm_page(struct snd_pcm_substream *substream,
+ 					 unsigned long offset)
+ {
++	/*
++	 * BF7: dummy_page[] объявлен статически и нигде не инициализируется —
++	 * ни в этом файле, ни где-либо ещё в дереве. virt_to_page(NULL) даёт
++	 * мусорный указатель (0xffffffbf00000000 на этом ядре), и get_page()
++	 * по нему роняет ядро в snd_pcm_mmap_data_fault. Любое приложение,
++	 * отобразившее буфер PCM, перезагружало телефон.
++	 *
++	 * Возвращаем NULL: ядро ответит VM_FAULT_SIGBUS, и в худшем случае
++	 * умрёт приложение, а не система. Отображение всё равно отключено —
++	 * см. снятые флаги SNDRV_PCM_INFO_MMAP в этом файле.
++	 */
++	if (!dummy_page[substream->stream])
++		return NULL;
++
+ 	return virt_to_page(dummy_page[substream->stream]); /* the same page */
+ }
+ 
+-- 
+2.55.0
+

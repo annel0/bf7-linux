@@ -1,0 +1,17 @@
+[Unit]
+# BF7: NMEA из GPS для geoclue — /run/bf7-gps/nmea.sock. Приёмник включён,
+# только пока к сокету кто-то подключён (geoclue — пока приложению нужно место).
+Description=GPS BF7: раздача NMEA
+After=bf7-gps.service
+Requires=bf7-gps.service
+# перезапуск mnld сбрасывает состояние HAL — раздатчик перезапускается следом
+PartOf=bf7-gps.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bf7-gps-nmea
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

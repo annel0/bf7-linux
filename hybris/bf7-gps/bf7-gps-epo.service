@@ -1,0 +1,11 @@
+[Unit]
+Description=GPS BF7: эфемериды EPO наперёд (wepodownload.mediatek.com)
+After=network-online.target
+Wants=network-online.target
+# без маршрута в сеть не пытаться — таймер повторит позже
+ConditionPathExists=/data/vendor/gps
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c 'ip route show default | grep -q .'
+ExecStart=/usr/local/sbin/bf7-gps-epo

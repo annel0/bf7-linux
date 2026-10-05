@@ -1,0 +1,117 @@
+From 221b5d7cb99dd219defa565296e2836f0f7e20ae Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 01:26:02 +0300
+Subject: [PATCH 14/40] =?UTF-8?q?bf7-disp:=20=D1=83=D1=81=D1=8B=D0=BF?=
+ =?UTF-8?q?=D0=BB=D1=8F=D1=82=D1=8C=20=D1=82=D1=80=D0=B0=D0=BA=D1=82=20?=
+ =?UTF-8?q?=D1=8D=D0=BA=D1=80=D0=B0=D0=BD=D0=B0=20=D0=BF=D1=80=D0=B8=20?=
+ =?UTF-8?q?=D0=B2=D1=8B=D0=BA=D0=BB=D1=8E=D1=87=D0=B5=D0=BD=D0=B8=D0=B8=20?=
+ =?UTF-8?q?=D0=BA=D0=BE=D0=BD=D0=B2=D0=B5=D0=B9=D0=B5=D1=80=D0=B0=20(?=
+ =?UTF-8?q?=D0=B2=D1=8B=D0=BA=D0=BB=D1=8E=D1=87=D0=B5=D0=BD=D0=BE)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Гашение экрана композитором лишь выводило чёрный кадр: панель, канал
+DSI и блок дисплея оставались под питанием и обновлялись 60 раз в
+секунду при погашенной подсветке. А pri_disp_wakelock отпускается
+только в primary_display_suspend(), которую никто не звал, — поэтому
+ядро отменило бы любую попытку сна.
+
+Теперь при выключении конвейера — FB_SUSPEND и primary_display_suspend(),
+при включении — FB_RESUME и primary_display_resume(), ровно как
+mtkfb_blank. Путь на нашей связке не испытан, поэтому по умолчанию
+выключен: echo 1 > /sys/module/bf7_drm/parameters/usyplyat_panel.
+Разбуживание при включении работает всегда, даже если параметр успели
+выключить.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../mediatek/video/mt6765/videox/bf7_drm.c    | 58 +++++++++++++++++++
+ 1 file changed, 58 insertions(+)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+index e47290747..12da3f2ed 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+@@ -677,6 +677,58 @@ static const struct drm_framebuffer_funcs bf7_fb_funcs = {
+ 	.dirty		= tinydrm_fb_dirty,
+ };
+ 
++/*
++ * BF7: усыплять тракт экрана вместе с конвейером.
++ *
++ * Выключение конвейера (так композитор гасит экран) до сих пор лишь
++ * выводило чёрный кадр. Сам тракт — панель, её контроллер, канал DSI, блок
++ * дисплея — оставался под питанием и обновлялся шестьдесят раз в секунду,
++ * просто с погашенной подсветкой. Вдобавок держатель пробуждения
++ * pri_disp_wakelock берётся при старте и отпускается только в
++ * primary_display_suspend(): пока её никто не зовёт, ядро отменяет любую
++ * попытку сна (первая проба сна 2026-09-23 застала его активным).
++ *
++ * Делаем ровно как старый путь гашения mtkfb (mtkfb_blank →
++ * mtkfb_early_suspend / mtkfb_late_resume): режим питания FB_SUSPEND и
++ * primary_display_suspend(), при включении — FB_RESUME и
++ * primary_display_resume(), только на обычной стадии помощника дисплея.
++ *
++ * На нашей связке этот путь никто не испытывал, поэтому он выключен по
++ * умолчанию и включается на лету:
++ *   echo 1 > /sys/module/bf7_drm/parameters/usyplyat_panel
++ * Кадры в усыплённый тракт не идут: при выключенном конвейере
++ * bf7_fb_dirty ничего не показывает.
++ */
++static bool bf7_usyplyat_panel;
++module_param_named(usyplyat_panel, bf7_usyplyat_panel, bool, 0644);
++MODULE_PARM_DESC(usyplyat_panel, "Усыплять тракт экрана при выключении конвейера");
++
++static void bf7_trakt_usypit(void)
++{
++	if (!bf7_usyplyat_panel || primary_display_is_sleepd())
++		return;
++	if (disp_helper_get_stage() != DISP_HELPER_STAGE_NORMAL)
++		return;
++	primary_display_set_power_mode(FB_SUSPEND);
++	if (primary_display_suspend() < 0)
++		DRM_ERROR("bf7: тракт экрана не усыпился\n");
++	else
++		DRM_INFO("bf7: тракт экрана усыплён\n");
++}
++
++static void bf7_trakt_razbudit(void)
++{
++	if (!primary_display_is_sleepd())
++		return;
++	if (disp_helper_get_stage() != DISP_HELPER_STAGE_NORMAL)
++		return;
++	primary_display_set_power_mode(FB_RESUME);
++	if (primary_display_resume())
++		DRM_ERROR("bf7: тракт экрана не проснулся\n");
++	else
++		DRM_INFO("bf7: тракт экрана разбужен\n");
++}
++
+ static void bf7_pipe_enable(struct drm_simple_display_pipe *pipe,
+ 			    struct drm_crtc_state *crtc_state,
+ 			    struct drm_plane_state *plane_state)
+@@ -685,6 +737,11 @@ static void bf7_pipe_enable(struct drm_simple_display_pipe *pipe,
+ 	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
+ 
+ 	DRM_DEBUG_KMS("bf7: включение конвейера\n");
++	/*
++	 * Будим всегда, если тракт спит, — даже если параметр успели
++	 * выключить: иначе экран не включится вовсе.
++	 */
++	bf7_trakt_razbudit();
+ 	bf7->enabled = true;
+ 
+ 	/*
+@@ -720,6 +777,7 @@ static void bf7_pipe_disable(struct drm_simple_display_pipe *pipe)
+ 	}
+ 
+ 	bf7->enabled = false;
++	bf7_trakt_usypit();
+ }
+ 
+ static const struct drm_simple_display_pipe_funcs bf7_pipe_funcs = {
+-- 
+2.55.0
+

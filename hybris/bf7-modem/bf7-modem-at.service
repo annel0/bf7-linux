@@ -1,0 +1,19 @@
+[Unit]
+# BF7: мост AT-порта модема (/dev/ttyC0, не tty) к /dev/ttyp0 — настоящему
+# терминалу, который видит ModemManager. См. bf7-at-most.c.
+Description=AT-порт модема для ModemManager
+After=bf7-modem.service
+BindsTo=bf7-modem.service
+Before=ModemManager.service
+# Модем перезапустился — он снова в CFUN=0 и без подготовки SIM, а
+# ModemManager помнит прежнее. Вместе с мостом перезапускаем обоих
+# (PartOf у них), Upholds поднимает их снова.
+Upholds=bf7-modem-sim.service ModemManager.service
+
+[Service]
+ExecStart=/usr/local/sbin/bf7-at-most /dev/ttyC0 /dev/ptyp0
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

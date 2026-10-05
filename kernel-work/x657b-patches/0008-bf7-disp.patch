@@ -1,0 +1,258 @@
+From 7edd273a17be09abe940d3eecdd3de38f1159bf7 Mon Sep 17 00:00:00 2001
+From: bf7 <bf7@local>
+Date: Wed, 16 Sep 2026 18:05:32 +0300
+Subject: [PATCH 08/40] =?UTF-8?q?bf7-disp:=20=D1=81=D0=BD=D0=B8=D0=BC?=
+ =?UTF-8?q?=D0=BE=D0=BA=20=D1=8D=D0=BA=D1=80=D0=B0=D0=BD=D0=B0=20=E2=80=94?=
+ =?UTF-8?q?=20=D0=B8=20=D0=BF=D0=BE=D1=87=D0=B8=D0=BD=D0=BA=D0=B0=20=D0=B2?=
+ =?UTF-8?q?=D0=B5=D0=BD=D0=B4=D0=BE=D1=80=D1=81=D0=BA=D0=BE=D0=B3=D0=BE=20?=
+ =?UTF-8?q?=D0=B7=D0=B0=D1=85=D0=B2=D0=B0=D1=82=D0=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Снимок нужен, чтобы проверять вывод без хозяина у телефона: при показе
+без копирования своего буфера нет, читать нечего, а тракт молчит
+одинаково и когда кадр дошёл, и когда слой выключен чужим кодом.
+
+Путей два, по режиму сессии.
+
+В развязке (а именно так работает наш композитор) WDMA0 занят по делу:
+OVL собирает кадр в промежуточный буфер, а панель кормит RDMA из него
+же. Снимать тогда нечего — читаем тот самый буфер. Тракт не трогаем
+вообще. Замок сознательно не берём: десяток миллисекунд копирования под
+замком остановил бы вывод, а худшее без замка — разрыв по горизонтали.
+
+В прямой связи подключаем WDMA0 к выходу OVL0 вендорским
+_screen_cap_by_cpu(). Он был сломан и никогда не вызывался: сразу после
+_primary_path_lock() шёл primary_display_idlemgr_kick(.., 1), а единица
+означает «возьми замок сам» — тот же самый. Поток навсегда уходит в D
+вместе с замком тракта, рабочий стол замирает, и снять это можно только
+перезагрузкой. Соседний _screen_cap_by_cmdq() передаёт сюда 0.
+
+Заодно там же проверяется ответ dpmgr_path_add_memout(): WDMA0 один, и
+если он уже подключён, отказ надо вернуть, а не идти настраивать чужой
+блок и ждать события, которого не будет.
+
+Наружу снимок всегда отдаётся в XRGB8888, каким бы путём ни получен.
+---
+ .../mediatek/video/mt6765/videox/bf7_drm.c    |   3 +-
+ .../misc/mediatek/video/mt6765/videox/mtkfb.c |  30 +++--
+ .../video/mt6765/videox/primary_display.c     | 107 +++++++++++++++---
+ .../video/mt6765/videox/primary_display.h     |   5 +-
+ 4 files changed, 118 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+index 3c4e58220..db9998317 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+@@ -390,7 +390,8 @@ static ssize_t bf7_capture_read(struct file *file, char __user *ubuf,
+ 		if (ret)
+ 			goto out;
+ 
+-		ret = primary_display_capture_to_mva(bf7->cap_mva);
++		ret = primary_display_capture_bf7(bf7->cap_va, bf7->cap_size,
++						  bf7->cap_mva);
+ 		if (ret) {
+ 			DRM_ERROR("bf7: снимок не получился: %zd\n", ret);
+ 			goto out;
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+index dba89dd64..8b1ef35f0 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+@@ -725,21 +725,25 @@ static void set_fb_fix(struct mtkfb_device *fbdev)
+ 	fix->smem_start = fbdev->fb_pa_base;
+ 
+ 	fix->xpanstep = 0;
+-#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
+ 	/*
+-	 * BF7: tell fbcon there is no hardware panning.
++	 * BF7: панорамирование разрешено пользовательскому коду, но не fbcon.
++	 *
++	 * Раньше здесь стояло ypanstep = 0 при включённой консоли: fbcon
++	 * прокручивал текст панорамированием по трижды буферизованной области,
++	 * рисовал глифы на одной странице и ждал, что вывод переедет следом, —
++	 * страницы расходились, и консоль оставалась чёрной, хотя 296 светлых
++	 * точек лежали в буфере страницей дальше.
+ 	 *
+-	 * With ypanstep = 1 fbcon scrolls by panning around the triple-buffered
+-	 * virtual area: it draws the text into one page and expects the pan to
+-	 * follow.  Here the two came apart - glyphs ended up on page 1 while the
+-	 * overlay kept showing page 0, so the console stayed black while 296 lit
+-	 * pixels sat in the buffer one page further in.  Without panning fbcon
+-	 * redraws in place, always in the page that is actually on screen.
++	 * Но fbcon выбирает режим прокрутки по FBINFO_HWACCEL_YPAN в
++	 * info->flags (fbcon.c, updatescrollmode: good_pan), а не по одному
++	 * ypanstep. Флаг у нас не выставлен (info->flags = FBINFO_FLAG_DEFAULT),
++	 * поэтому консоль остаётся в режиме перерисовки на месте, а
++	 * FBIOPAN_DISPLAY из пользовательского кода начинает работать:
++	 * fb_pan_display() в fbmem.c отвергает любой ненулевой yoffset при
++	 * ypanstep == 0. Без этого композитор вынужден жить на одной странице и
++	 * получает разрыв кадра.
+ 	 */
+-	fix->ypanstep = 0;
+-#else
+ 	fix->ypanstep = 1;
+-#endif
+ 
+ 	/*
+ 	 * BF7: this runs after the static initialiser and used to clobber the
+@@ -1989,6 +1993,10 @@ static int mtkfb_fbinfo_init(struct fb_info *info)
+ 	ASSERT(fbdev->fb_va_base);
+ 	info->fbops = &mtkfb_ops;
+ 	info->flags = FBINFO_FLAG_DEFAULT;
++	/* BF7: см. комментарий к ypanstep — fbcon должен остаться в
++	 * режиме перерисовки, поэтому аппаратное панорамирование ему
++	 * не объявляется. */
++	info->flags &= ~FBINFO_HWACCEL_YPAN;
+ 	info->screen_base = (char *)fbdev->fb_va_base;
+ 	info->screen_size = fbdev->fb_size_in_byte;
+ 	info->pseudo_palette = fbdev->pseudo_palette;
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+index bd5642495..da716c242 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+@@ -8478,9 +8478,30 @@ static int _screen_cap_by_cpu(unsigned int mva, enum UNIFIED_COLOR_FMT ufmt,
+ 	}
+ 
+ 	_primary_path_lock(__func__);
+-	primary_display_idlemgr_kick(__func__, 1);
++	/*
++	 * BF7: было need_lock = 1 — и это самозаклинивание.
++	 *
++	 * primary_display_idlemgr_kick(.., 1) берёт primary_display_manual_lock(),
++	 * а это тот же самый disp_sw_mutex_lock(&pgc->lock), что уже взят строкой
++	 * выше. Поток навсегда уходит в D, причём вместе с замком тракта дисплея:
++	 * встаёт всё, что рисует на панель. Соседний _screen_cap_by_cmdq()
++	 * передаёт сюда 0 — то есть правильный вызов в этом же файле есть,
++	 * а эта ветка просто ни разу не выполнялась.
++	 */
++	primary_display_idlemgr_kick(__func__, 0);
+ 
+-	dpmgr_path_add_memout(pgc->dpmgr_handle, after_eng, NULL);
++	/*
++	 * BF7: ответ обязательно проверять. WDMA0 в тракте один, и если он уже
++	 * подключён, add_memout отказывает — а дальше код всё равно настраивал
++	 * бы чужой блок и ждал события, которого не будет.
++	 */
++	ret = dpmgr_path_add_memout(pgc->dpmgr_handle, after_eng, NULL);
++	if (ret) {
++		DISPERR("bf7: WDMA0 не подключить к выходу: %d\n", ret);
++		_primary_path_unlock(__func__);
++		dpmgr_path_memout_clock(pgc->dpmgr_handle, 0);
++		return -EBUSY;
++	}
+ 
+ 	pconfig = dpmgr_path_get_last_config(pgc->dpmgr_handle);
+ 	pconfig->wdma_dirty = 1;
+@@ -8518,21 +8539,81 @@ static int _screen_cap_by_cpu(unsigned int mva, enum UNIFIED_COLOR_FMT ufmt,
+ /*
+  * BF7: снимок того, что тракт дисплея действительно вывел.
+  *
+- * Обёртка над _screen_cap_by_cpu(): та подключает WDMA0 к выходу OVL0 и
+- * получает ровно тот кадр, который ушёл в панель, — включая слои, которых мы
+- * не ставили. Без неё проверить вывод можно только глазами, а телефон бывает
+- * не под рукой.
++ * Зачем. Убедиться, что кадр дошёл до панели, иначе нельзя: при показе без
++ * копирования своего буфера у нас нет, читать нечего, а тракт молчит одинаково
++ * и когда всё хорошо, и когда слой выключен чужим кодом.
++ *
++ * Наружу всегда отдаём XRGB8888, каким бы путём снимок ни получен, — чтобы у
++ * читающей стороны не было выбора и ошибок.
++ */
++
++/*
++ * Снимок в режиме развязки.
++ *
++ * Тут WDMA0 занят по делу: OVL собирает кадр в промежуточный буфер, а панель
++ * кормит RDMA из него же. Значит снимать нечего — достаточно прочитать тот
++ * самый буфер. Тракт при этом не трогаем вообще, а это несравнимо безопаснее
++ * подключения памяти на выход.
+  *
+- * Формат BGRA8888 выбран не случайно: синий в младшем байте, то есть снимок
+- * читается как DRM_FORMAT_XRGB8888 без перестановки байтов.
++ * Замок сознательно не берём: десяток миллисекунд копирования под замком
++ * тракта остановил бы вывод, а худшее, что грозит снимку без замка, — разрыв
++ * по горизонтали, если кадр как раз дописывается.
+  *
+- * Функция статическая и в этом дереве ни разу не вызывается, так что путь
+- * непроверенный; поэтому у неё единственный вызывающий — отладочный файл,
+- * и сама собой она не срабатывает никогда.
++ * Буферов три, формат RGB888, шаг — ширина панели. Лежат либо каждый по своему
++ * адресу (оптимизация GMO), либо подряд в зарезервированной области
++ * фреймбуфера.
+  */
+-int primary_display_capture_to_mva(unsigned int mva)
++static int _screen_cap_decouple(void *dst, size_t dst_size)
++{
++	unsigned int w = primary_display_get_width();
++	unsigned int h = primary_display_get_height();
++	size_t pixels = (size_t)w * h;
++	size_t frame = pixels * 3;
++	const u8 *src;
++	u32 *out = dst;
++	size_t i;
++	int id = pgc->dc_buf_id;
++
++	if (!dst || dst_size < pixels * 4)
++		return -ENOSPC;
++
++	if (id < 0 || id >= DISP_INTERNAL_BUFFER_COUNT)
++		id = 0;
++
++	if (decouple_buffer_info[id] && decouple_buffer_info[id]->va)
++		src = decouple_buffer_info[id]->va;
++	else if (pgc->framebuffer_va)
++		src = (const u8 *)(pgc->framebuffer_va +
++				   (unsigned long)id * frame);
++	else
++		return -ENODEV;
++
++	for (i = 0; i < pixels; i++)
++		out[i] = ((u32)src[i * 3 + 0] << 16) |
++			 ((u32)src[i * 3 + 1] << 8) |
++			  (u32)src[i * 3 + 2];
++
++	return 0;
++}
++
++/*
++ * Снимок: dst — куда положить пиксели, dst_mva — тот же буфер глазами M4U
++ * (нужен только пути через WDMA, который пишет сам, мимо процессора).
++ */
++int primary_display_capture_bf7(void *dst, size_t dst_size,
++				unsigned int dst_mva)
+ {
+-	return _screen_cap_by_cpu(mva, UFMT_BGRA8888, DISP_MODULE_OVL0);
++	if (!primary_display_is_alive())
++		return -ENODEV;
++
++	if (primary_display_is_decouple_mode()) {
++		pr_info("bf7: снимок из буфера развязки (режим %d)\n",
++			pgc->session_mode);
++		return _screen_cap_decouple(dst, dst_size);
++	}
++
++	pr_info("bf7: снимок через WDMA0 (режим %d)\n", pgc->session_mode);
++	return _screen_cap_by_cpu(dst_mva, UFMT_BGRA8888, DISP_MODULE_OVL0);
+ }
+ #endif
+ 
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/primary_display.h b/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
+index 52797c977..9411cb4c6 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
++++ b/drivers/misc/mediatek/video/mt6765/videox/primary_display.h
+@@ -410,8 +410,9 @@ int primary_display_diagnose(void);
+ int primary_display_get_info(struct disp_session_info *info);
+ int primary_display_capture_framebuffer(unsigned long pbuf);
+ #if IS_ENABLED(CONFIG_DRM_BF7_DISP)
+-/* BF7: снимок выхода OVL0 в буфер, отображённый в M4U. */
+-int primary_display_capture_to_mva(unsigned int mva);
++/* BF7: снимок экрана в XRGB8888; dst_mva нужен только пути через WDMA0. */
++int primary_display_capture_bf7(void *dst, size_t dst_size,
++				unsigned int dst_mva);
+ #endif
+ int primary_display_is_video_mode(void);
+ int primary_is_sec(void);
+-- 
+2.55.0
+

@@ -1,0 +1,9 @@
+# Скачивается и собирается podgotovit.sh — в git только скрипты.
+*
+!.gitignore
+!podgotovit.sh
+!skazat-pc
+!sluh-pc
+!README.md
+!dialog-storozh
+!sms-storozh

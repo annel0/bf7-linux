@@ -1,0 +1,17 @@
+--- a/src/mm-base-bearer.c
++++ b/src/mm-base-bearer.c
+@@ -48,9 +48,12 @@
+ 
+ #define BEARER_STATS_UPDATE_TIMEOUT 30
+ 
+-/* Initial connectivity check after 30s, then each 5s */
++/* Initial connectivity check after 30s, then each 30s */
+ #define BEARER_CONNECTION_MONITOR_INITIAL_TIMEOUT 30
+-#define BEARER_CONNECTION_MONITOR_TIMEOUT          5
++/* BF7: was 5 s. Each check is a +CGACT? round-trip to the modem, which wakes
++ * the CPU and the AT link every 5 s while data is up, screen on or off. A
++ * dropped bearer is now noticed within 30 s instead of 5. */
++#define BEARER_CONNECTION_MONITOR_TIMEOUT          30
+ 
+ static void log_object_iface_init (MMLogObjectInterface *iface);
+ 

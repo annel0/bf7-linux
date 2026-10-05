@@ -1,0 +1,17 @@
+[Unit]
+Description=GUI на панели телефона (Qt Quick на PowerVR)
+After=bf7-android-mounts.service systemd-udevd.service
+Requires=bf7-android-mounts.service
+ConditionPathExists=/root/gui/bf7gui
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bf7-gui
+Restart=on-failure
+RestartSec=3
+# Логи libhybris и драйвера многословны, оставляем в journal.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,44 @@
+From 0946bfa2915c35f5342b32b7f878153d3ae45843 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 08:26:22 +0300
+Subject: [PATCH 16/40] =?UTF-8?q?TD4160:=20=D0=BD=D0=B5=20=D1=80=D0=B0?=
+ =?UTF-8?q?=D0=B7=D1=8B=D0=BC=D0=B5=D0=BD=D0=BE=D0=B2=D1=8B=D0=B2=D0=B0?=
+ =?UTF-8?q?=D1=82=D1=8C=20transition=20=D0=B4=D0=BE=20=D0=BF=D1=80=D0=B8?=
+ =?UTF-8?q?=D1=81=D0=B2=D0=B0=D0=B8=D0=B2=D0=B0=D0=BD=D0=B8=D1=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+В обработчике оповещений fb указатель читался в проверке перепрошивки
+раньше, чем ему присвоено значение. Пока оповещений не было вовсе, это
+не проявлялось; теперь их шлёт bf7_drm.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/input/touchscreen/TD4160/synaptics_tcm_core.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
+index bbed7f361..7c2635a40 100644
+--- a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
++++ b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
+@@ -3131,6 +3131,16 @@ static int syna_tcm_fb_notifier_cb(struct notifier_block *nb,
+ 
+ 	retval = 0;
+ 
++	/*
++	 * BF7: у донора указатель transition разыменовывался здесь раньше,
++	 * чем ему что-то присвоено (присваивание ниже), — мусорный адрес, как
++	 * только гашение совпадёт с перепрошивкой контроллера. Пока оповещений
++	 * о гашении не было вовсе, этого не случалось; теперь их шлёт bf7_drm.
++	 */
++	if (!evdata || !evdata->data)
++		return 0;
++	transition = evdata->data;
++
+ 	if (atomic_read(&tcm_hcd->firmware_flashing) && *transition ==
+ 		FB_BLANK_POWERDOWN) {
+ 		retval = wait_event_interruptible_timeout(tcm_hcd->reflash_wq,
+-- 
+2.55.0
+

@@ -1,0 +1,35 @@
+[Unit]
+# BF7: подстраховка на случай недостающих узлов устройств.
+# Подробности — в /usr/local/sbin/bf7-devnodes-all.
+#
+# Порядок здесь важнее, чем кажется. Раньше стояло
+# Before=bf7-android-mounts.service — и получался цикл:
+#
+#   systemd-udevd -> bf7-devnodes-all -> bf7-android-mounts -> systemd-udevd
+#
+# (последняя стрелка — из Before=systemd-udevd.service у mounts: udev при
+# опросе железа грузит модули, а те просят прошивки из /vendor/firmware, см.
+# /sys/module/firmware_class/parameters/path). Цикл systemd разрывает молча,
+# удаляя одно задание, и какое именно — решает случайный порядок хеш-таблицы.
+# Когда жертвой становился bf7-android-mounts, вместе с ним по Requires=
+# слетали bf7-android-hal и bf7-fuelgauge: батарея показывала -1, декодер не
+# работал. Загрузка от загрузки выходила разной, и это выглядело как что
+# угодно, только не как ошибка в порядке.
+#
+# Петлевые устройства mounts берёт через /dev/loop-control, их заводит ядро,
+# так что быть раньше mounts этой службе незачем.
+Description=Восполнить узлы устройств BF7
+DefaultDependencies=no
+After=systemd-udev-trigger.service systemd-udevd.service
+Wants=systemd-udev-trigger.service
+Before=bf7-audio.service sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bf7-devnodes-all
+
+[Install]
+WantedBy=sysinit.target

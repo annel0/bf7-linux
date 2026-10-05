@@ -1,0 +1,25 @@
+[Unit]
+# Набор служб Android, без которого не работает аппаратный декодер.
+#
+# Нужны трое: hwservicemanager (диспетчер HIDL), vndservicemanager (диспетчер
+# вендорского binder) и android.hardware.graphics.allocator@4.0 — через него
+# Codec2 выделяет буферы под кадры. Службы питания в наборе намеренно нет:
+# она жжёт целое ядро и декодеру не нужна, подробности в самом скрипте.
+#
+# Раньше их поднимали руками после каждой перезагрузки, и это каждый раз
+# выглядело как «декодер сломался».
+Description=Службы Android для аппаратного декодера (hwservicemanager, vndservicemanager, gralloc4)
+After=bf7-binderfs.service bf7-android-mounts.service
+Requires=bf7-binderfs.service bf7-android-mounts.service
+Before=bf7-videod.service
+
+[Service]
+# Скрипт запускает демонов через setsid и завершается сам; демоны остаются в
+# группе службы, поэтому systemctl stop их и снимет.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/hal-start.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

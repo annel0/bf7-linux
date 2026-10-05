@@ -1,0 +1,247 @@
+From 8db1342ad9431bffde3ead6d695ccd400d57ca07 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Tue, 15 Sep 2026 21:20:32 +0300
+Subject: [PATCH 03/40] mtkfb: make the framebuffer console actually reach the
+ panel
+
+The OEM Android kernel is built with CONFIG_VT off, so the fbcon->mtkfb
+path was never exercised by the vendor and carried two independent bugs.
+fbcon bound and reported "colour frame buffer device 90x100", yet the
+panel stayed black and the whole 14 MB framebuffer read back as zeroes.
+
+Instrumenting fbcon_init(), fbcon_putcs(), bit_putcs() and
+bit_putcs_aligned() showed fbcon working perfectly - inact=0, gfx=0,
+maxcnt=512, geometry 720x16 at dy=0,16,32 - and calling fb_imageblit().
+Printing the pointer with %pS instead of %p gave it away: mtkfb_ops held
+cfb_imageblit, not the console wrapper the static initialiser installs.
+
+1) set_fb_fix() runs after the static initialiser and unconditionally
+   overwrote fb_fillrect/fb_copyarea/fb_imageblit with the raw cfb_*
+   helpers, so the mtkfb_con_* wrappers never got installed and fbcon
+   drew straight into screen_base - no pan, no dcache flush. Guard both
+   arms with CONFIG_FRAMEBUFFER_CONSOLE. This also explains why the
+   neighbouring fix->ypanstep change did take effect.
+
+2) mtkfb_ops has no .fb_setcolreg, and that is what fills
+   info->pseudo_palette. fb_set_cmap() checks for it and returns -EINVAL
+   rather than crashing, so the palette silently stayed zeroed. With
+   FB_VISUAL_TRUECOLOR cfb_imageblit() reads fg/bg from that table, so
+   every glyph came out fg = bg = 0: the console had been drawing black
+   on black all along. Add mtkfb_setcolreg() for ARGB8888.
+
+Verified on a BF7 (MT6761, 720x1612 panel): the framebuffer now holds
+exactly the two console colours, 0xff000000 background and 0xffaaaaaa
+foreground, with text in 1230 rows. Frames really do reach the panel -
+the ovl0 interrupt count climbs by ~250 per 6 s while fbcon is bound and
+stops dead (+0) when vtcon1 is unbound.
+---
+ .../misc/mediatek/video/mt6765/videox/mtkfb.c | 157 ++++++++++++++++++
+ 1 file changed, 157 insertions(+)
+
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+index ab576cfd2..dba89dd64 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/mtkfb.c
+@@ -559,6 +559,20 @@ static int mtkfb_pan_display_impl(struct fb_var_screeninfo *var,
+ 				*(unsigned int *)(vaStart+8),
+ 				*(unsigned int *)(vaStart+0xC));
+ 
++	/*
++	 * BF7: push the CPU's view of the framebuffer out to memory before the
++	 * overlay engine reads it.
++	 *
++	 * The framebuffer is mapped cached and nothing here ever flushed it -
++	 * vaEnd was computed just above and then never used.  Android does not
++	 * notice because SurfaceFlinger composes through ION buffers and HWC,
++	 * not through /dev/fb0, so this path is effectively only used by the
++	 * framebuffer console.  Without the flush the panel shows whatever
++	 * happened to be evicted from the cache: writing 200 solid lines and
++	 * flipping produced three stray coloured slivers on the display.
++	 */
++	__flush_dcache_area(vaStart, (size_t)(vaEnd - vaStart));
++
+ 	session_input = kzalloc(sizeof(*session_input), GFP_KERNEL);
+ 	if (!session_input) {
+ 		DISPERR("session input allocat fail\n");
+@@ -629,6 +643,50 @@ static int mtkfb_pan_display_impl(struct fb_var_screeninfo *var,
+ }
+ 
+ 
++#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
++static void mtkfb_con_fillrect(struct fb_info *info,
++			       const struct fb_fillrect *rect);
++static void mtkfb_con_copyarea(struct fb_info *info,
++			       const struct fb_copyarea *area);
++static void mtkfb_con_imageblit(struct fb_info *info,
++				const struct fb_image *image);
++
++/*
++ * BF7: mtkfb ships without a setcolreg callback - the OEM kernel is built with
++ * CONFIG_VT off, so nothing ever filled info->pseudo_palette and fb_set_cmap()
++ * bailed out with -EINVAL.  cfb_imageblit() looks the console colours up in
++ * that table for a truecolor visual, so every glyph came out with
++ * fg = bg = 0: the console really was drawing, black on black.
++ */
++static int mtkfb_setcolreg(unsigned int regno, unsigned int red,
++			   unsigned int green, unsigned int blue,
++			   unsigned int transp, struct fb_info *info)
++{
++	struct fb_var_screeninfo *var = &info->var;
++	u32 *pal = info->pseudo_palette;
++
++	if (info->fix.visual != FB_VISUAL_TRUECOLOR)
++		return -EINVAL;
++	if (regno >= 16 || !pal)
++		return -EINVAL;
++
++	red   >>= 16 - var->red.length;
++	green >>= 16 - var->green.length;
++	blue  >>= 16 - var->blue.length;
++
++	pal[regno] = (red << var->red.offset) |
++		     (green << var->green.offset) |
++		     (blue << var->blue.offset);
++
++	/* The overlay blends with per-layer alpha, so keep pixels opaque. */
++	if (var->transp.length)
++		pal[regno] |= ((1u << var->transp.length) - 1u)
++			      << var->transp.offset;
++
++	return 0;
++}
++#endif
++
+ /* Set fb_info.fix fields and also updates fbdev.
+  * When calling this fb_info.var must be set up already.
+  */
+@@ -667,11 +725,36 @@ static void set_fb_fix(struct mtkfb_device *fbdev)
+ 	fix->smem_start = fbdev->fb_pa_base;
+ 
+ 	fix->xpanstep = 0;
++#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
++	/*
++	 * BF7: tell fbcon there is no hardware panning.
++	 *
++	 * With ypanstep = 1 fbcon scrolls by panning around the triple-buffered
++	 * virtual area: it draws the text into one page and expects the pan to
++	 * follow.  Here the two came apart - glyphs ended up on page 1 while the
++	 * overlay kept showing page 0, so the console stayed black while 296 lit
++	 * pixels sat in the buffer one page further in.  Without panning fbcon
++	 * redraws in place, always in the page that is actually on screen.
++	 */
++	fix->ypanstep = 0;
++#else
+ 	fix->ypanstep = 1;
++#endif
+ 
++	/*
++	 * BF7: this runs after the static initialiser and used to clobber the
++	 * console wrappers below with the raw cfb_* helpers, so fbcon drew into
++	 * screen_base without ever triggering a pan or a cache flush.
++	 */
++#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
++	fbops->fb_fillrect = mtkfb_con_fillrect;
++	fbops->fb_copyarea = mtkfb_con_copyarea;
++	fbops->fb_imageblit = mtkfb_con_imageblit;
++#else
+ 	fbops->fb_fillrect = cfb_fillrect;
+ 	fbops->fb_copyarea = cfb_copyarea;
+ 	fbops->fb_imageblit = cfb_imageblit;
++#endif
+ }
+ 
+ 
+@@ -1743,6 +1826,73 @@ static int mtkfb_compat_ioctl(struct fb_info *info, unsigned int cmd,
+ }
+ #endif
+ 
++#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
++/*
++ * BF7: make the framebuffer console actually reach the panel.
++ *
++ * On a plain fbdev the scanout hardware reads the framebuffer continuously, so
++ * drawing into it is enough.  Here it is not: the panel shows whatever the
++ * overlay engine was last pointed at, and only mtkfb_pan_display_impl() both
++ * points an overlay at our buffer and triggers a flush.  fbcon draws through
++ * cfb_fillrect/cfb_copyarea/cfb_imageblit, which touch memory and nothing else,
++ * so the console was invisible - the boot loader's own font layer gets disabled
++ * on the first pan and nothing ever replaced it, leaving a black backlit panel.
++ *
++ * mtkfb_pan_display_impl() takes a mutex and does GFP_KERNEL allocations, so it
++ * must not be called from the drawing path: fbcon draws from printk context,
++ * which can be atomic.  Mark the frame dirty instead and let a delayed work
++ * push it out; re-arming an already pending work is a no-op, so this naturally
++ * throttles to one flush per interval no matter how much text arrives.
++ */
++#define MTKFB_CON_FLUSH_MS	30
++
++static struct fb_info *mtkfb_con_info;
++static atomic_t mtkfb_con_dirty = ATOMIC_INIT(0);
++
++static void mtkfb_con_flush(struct work_struct *work);
++static DECLARE_DELAYED_WORK(mtkfb_con_work, mtkfb_con_flush);
++
++static void mtkfb_con_flush(struct work_struct *work)
++{
++	struct fb_info *info = mtkfb_con_info;
++
++	if (!info)
++		return;
++
++	if (atomic_xchg(&mtkfb_con_dirty, 0))
++		mtkfb_pan_display_impl(&info->var, info);
++}
++
++static void mtkfb_con_damaged(struct fb_info *info)
++{
++	mtkfb_con_info = info;
++	atomic_set(&mtkfb_con_dirty, 1);
++	schedule_delayed_work(&mtkfb_con_work,
++			      msecs_to_jiffies(MTKFB_CON_FLUSH_MS));
++}
++
++static void mtkfb_con_fillrect(struct fb_info *info,
++			       const struct fb_fillrect *rect)
++{
++	cfb_fillrect(info, rect);
++	mtkfb_con_damaged(info);
++}
++
++static void mtkfb_con_copyarea(struct fb_info *info,
++			       const struct fb_copyarea *area)
++{
++	cfb_copyarea(info, area);
++	mtkfb_con_damaged(info);
++}
++
++static void mtkfb_con_imageblit(struct fb_info *info,
++				const struct fb_image *image)
++{
++	cfb_imageblit(info, image);
++	mtkfb_con_damaged(info);
++}
++#endif /* CONFIG_FRAMEBUFFER_CONSOLE */
++
+ static int mtkfb_pan_display_proxy(struct fb_var_screeninfo *var,
+ 	struct fb_info *info)
+ {
+@@ -1760,9 +1910,16 @@ static struct fb_ops mtkfb_ops = {
+ 	.fb_open = mtkfb_open,
+ 	.fb_release = mtkfb_release,
+ 	.fb_pan_display = mtkfb_pan_display_proxy,
++#if defined(CONFIG_FRAMEBUFFER_CONSOLE)
++	.fb_setcolreg = mtkfb_setcolreg,
++	.fb_fillrect = mtkfb_con_fillrect,
++	.fb_copyarea = mtkfb_con_copyarea,
++	.fb_imageblit = mtkfb_con_imageblit,
++#else
+ 	.fb_fillrect = cfb_fillrect,
+ 	.fb_copyarea = cfb_copyarea,
+ 	.fb_imageblit = cfb_imageblit,
++#endif
+ 	.fb_cursor = mtkfb_soft_cursor,
+ 	.fb_check_var = mtkfb_check_var,
+ 	.fb_set_par = mtkfb_set_par,
+-- 
+2.55.0
+

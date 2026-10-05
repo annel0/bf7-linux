@@ -1,0 +1,14 @@
+[Unit]
+Description=Своп в сжатой памяти (zram0)
+Documentation=man:zram-generator.conf(5)
+Requires=systemd-zram-setup@zram0.service
+After=systemd-zram-setup@zram0.service
+# Генератор zram создаёт такой юнит сам, но только на раннем этапе загрузки;
+# явный юнит гарантирует, что своп поднимется и после ручной перенастройки.
+
+[Swap]
+What=/dev/zram0
+Priority=100
+
+[Install]
+WantedBy=swap.target

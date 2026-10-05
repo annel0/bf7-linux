@@ -1,0 +1,25 @@
+# BF7: модем MediaTek для ModemManager.
+#
+# /dev/ttyp0 — мост к AT-порту модема (bf7-at-most). У него нет физического
+# устройства, поэтому связываем порты общим ID_MM_PHYSDEV_UID (так же MM
+# собирает встроенные модемы Qualcomm) и явно разрешаем разбор:
+# ID_MM_DEVICE_PROCESS — строгий фильтр MM иначе не пустит виртуальный tty.
+# ID_MM_BF7_MTK_NO_CLCC — для нашего пакета MM (заплатка
+# modemmanager-1.20-mtk-no-clcc.patch): пока входящий звонит, модем отвечает
+# на +CLCC пустым списком, и MM хоронил вызов через 2 с после каждого гудка.
+SUBSYSTEM=="tty", KERNEL=="ttyp0", ENV{ID_MM_CANDIDATE}="1", ENV{ID_MM_DEVICE_PROCESS}="1", ENV{ID_MM_PHYSDEV_UID}="bf7-modem", ENV{ID_MM_PORT_TYPE_AT_PRIMARY}="1", ENV{ID_MM_BF7_MTK_NO_CLCC}="1", ENV{ID_MM_BF7_MTK_DATA}="1"
+# Остальные старые pty к модему отношения не имеют — не опрашивать.
+SUBSYSTEM=="tty", KERNEL=="ttyp[1-9]", ENV{ID_MM_PORT_IGNORE}="1"
+SUBSYSTEM=="tty", KERNEL=="pty[p-z][0-9a-f]", ENV{ID_MM_PORT_IGNORE}="1"
+
+# Данные: у смартфонного модема MediaTek нет дозвона PPP по AT-каналу
+# (ATD*99# модем принимает за звонок на номер «*99***1#» и AT-порт виснет).
+# Данные идут через сетевые интерфейсы ccmni: AT+CGACT=1,<cid> поднимает
+# контекст, модем сам выбирает интерфейс — по кругу, с каждым подключением
+# следующий — и сообщает «+EIF: <id>, ifup, …», интерфейс ccmni<id % 100>
+# (100 → ccmni0, 504 → ccmni4, 605 → ccmni5). Адрес отдаёт AT+CGPADDR, DNS —
+# AT+CGCONTRDP. Общий модем ModemManager 1.20 так не умеет (только PPP),
+# поэтому у нас свой пакет MM с заплаткой (hybris/bf7-patches,
+# modemmanager-1.20-mtk-cgact-data.patch): при ID_MM_BF7_MTK_DATA=1 он так и
+# делает. Поэтому все ccmni0…ccmni20 показываем MM портами того же модема.
+SUBSYSTEM=="net", KERNEL=="ccmni[0-9]|ccmni1[0-9]|ccmni20", ENV{ID_MM_CANDIDATE}="1", ENV{ID_MM_DEVICE_PROCESS}="1", ENV{ID_MM_PHYSDEV_UID}="bf7-modem", ENV{ID_MM_BF7_MTK_DATA}="1"

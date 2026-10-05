@@ -1,0 +1,36 @@
+#!/bin/bash
+# Снять фотографию. Отклик — вибро, потому что в темноте больше нечем:
+# динамик на этом телефоне молчит, а на экран смотреть неудобно.
+#
+#   bf7-snap [сколько кадров складывать]
+#
+# один импульс  — начали, держите ровно
+# короткий      — кадры собраны, можно двигаться
+# два коротких  — снимок готов
+# длинный       — не вышло
+set -u
+N=${1:-4}
+D=${BF7_PHOTO_DIR:-/root/фото}
+V=/sys/class/leds/vibrator/brightness
+mkdir -p "$D"
+OUT="$D/$(date +%Y%m%d-%H%M%S)-n${N}.jpg"
+
+buzz() { [ -w $V ] && { echo 200 > $V; sleep "$1"; echo 0 > $V; }; }
+
+rm -f /run/bf7-camd.grabbed
+buzz 0.25
+echo "фото $OUT $N" > /run/bf7-camd
+
+for i in $(seq 1 80); do
+    [ -e /run/bf7-camd.grabbed ] && break
+    sleep 0.1
+done
+buzz 0.06                        # кадры собраны — можно двигаться
+
+for i in $(seq 1 200); do
+    [ -s "$OUT" ] && { sleep 0.3; buzz 0.06; sleep 0.12; buzz 0.06; echo "$OUT"; exit 0; }
+    sleep 0.25
+done
+buzz 0.8                         # не дождались
+echo "не вышло: $OUT" >&2
+exit 1

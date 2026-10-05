@@ -1,0 +1,16 @@
+[Unit]
+# BF7: ориентация для автоповорота вместо iio-sensor-proxy (у того нет
+# датчиков в IIO). Ориентацию считает bf7-seismograf, он владеет датчиком.
+Description=Датчики BF7 для оболочки (net.hadess.SensorProxy)
+After=dbus.service bf7-seismograf.service
+Wants=bf7-seismograf.service
+Conflicts=iio-sensor-proxy.service
+
+[Service]
+Type=dbus
+BusName=net.hadess.SensorProxy
+ExecStart=/usr/local/bin/bf7-sensor-proxy
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

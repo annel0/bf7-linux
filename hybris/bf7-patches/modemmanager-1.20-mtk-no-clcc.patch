@@ -1,0 +1,137 @@
+Description: MediaTek: do not trust +CLCC while a call is ringing
+ The MediaTek modem answers +CLCC with an empty list during an incoming
+ call, so call list polling terminated every ringing call. With
+ ID_MM_BF7_MTK_NO_CLCC=1 on the primary port the modem is handled as one
+ without +CLCC.
+Author: bf7
+Forwarded: not-needed
+
+Index: modemmanager-1.20.4/src/mm-broadband-modem.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-broadband-modem.c	2026-09-23 17:56:15.515443550 +0300
++++ modemmanager-1.20.4/src/mm-broadband-modem.c	2026-09-23 18:55:14.566148401 +0300
+@@ -7760,6 +7760,25 @@
+     /* +CLCC supported unless we got any error response */
+     self->priv->clcc_supported = !!mm_base_modem_at_command_finish (MM_BASE_MODEM (self), res, NULL);
+ 
++    /* MediaTek (BF7): +CLCC answers an empty list while an incoming call is
++     * still ringing, and the call list polling would then terminate every
++     * ringing call after two seconds. Such modems are tagged in udev with
++     * ID_MM_BF7_MTK_NO_CLCC=1 on the primary port; they are handled as
++     * modems without +CLCC (RING timeout, NO CARRIER ends the call). */
++    if (self->priv->clcc_supported) {
++        MMPortSerialAt *primary;
++        MMKernelDevice *kernel_device = NULL;
++
++        primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
++        if (primary)
++            kernel_device = mm_port_peek_kernel_device (MM_PORT (primary));
++        if (kernel_device &&
++            mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_NO_CLCC")) {
++            mm_obj_dbg (self, "+CLCC not trusted on this modem: call list polling disabled");
++            self->priv->clcc_supported = FALSE;
++        }
++    }
++
+     /* If +CLCC unsupported we disable polling in the parent directly */
+     g_object_set (self,
+                   MM_IFACE_MODEM_VOICE_PERIODIC_CALL_LIST_CHECK_DISABLED, !self->priv->clcc_supported,
+@@ -7909,6 +7928,8 @@
+     mm_iface_modem_voice_report_call (MM_IFACE_MODEM_VOICE (self), &call_info);
+ }
+ 
++static gboolean bf7_is_mtk_voice (MMBroadbandModem *self);
++
+ static void
+ set_voice_in_call_unsolicited_events_handlers (MMBroadbandModem *self,
+                                                PortsContext     *ports_ctx,
+@@ -7918,7 +7939,13 @@
+     g_autoptr(GRegex) in_call_event_regex = NULL;
+     guint             i;
+ 
+-    in_call_event_regex = g_regex_new ("\\r\\n(NO CARRIER|BUSY|NO ANSWER|NO DIALTONE)(\\r)?\\r\\n$",
++    /* MediaTek (BF7): NO CARRIER often comes in one read together with
++     * "+CIEV: 5, 0", and with the end-of-buffer anchor the end of the call
++     * was missed: the call stayed active and Calls hung up every new one.
++     * Here ATD answers OK at once, so NO CARRIER is never a command reply. */
++    in_call_event_regex = g_regex_new (bf7_is_mtk_voice (self) ?
++                                       "\\r\\n(NO CARRIER|BUSY|NO ANSWER|NO DIALTONE)(\\r)?\\r\\n" :
++                                       "\\r\\n(NO CARRIER|BUSY|NO ANSWER|NO DIALTONE)(\\r)?\\r\\n$",
+                                        G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+ 
+     ports[0] = MM_PORT_SERIAL_AT (ports_ctx->primary);
+@@ -8123,6 +8150,42 @@
+     g_free (call_info.number);
+ }
+ 
++/* MediaTek (BF7): the modem asks the host to approve every incoming call
++ * ("+EAIC: <id>,<number>,<type>,<mode>,<seq>", after AT+EAIC=2) and holds it
++ * until "AT+EAIC=0,<id>,<seq>" comes back; unapproved, +CLCC doesn't list the
++ * call, ATA fails with +CME ERROR: 100 and after ~20 s the network gives up.
++ * The vendor RIL approves every call; so do we. */
++static gboolean
++bf7_is_mtk_voice (MMBroadbandModem *self)
++{
++    MMPortSerialAt *primary;
++    MMKernelDevice *kernel_device = NULL;
++
++    primary = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
++    if (primary)
++        kernel_device = mm_port_peek_kernel_device (MM_PORT (primary));
++    return (kernel_device &&
++            mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_NO_CLCC"));
++}
++
++static void
++bf7_eaic_received (MMPortSerialAt   *port,
++                   GMatchInfo       *info,
++                   MMBroadbandModem *self)
++{
++    g_autofree gchar *id = NULL;
++    g_autofree gchar *seq = NULL;
++    g_autofree gchar *command = NULL;
++
++    id  = g_match_info_fetch (info, 1);
++    seq = g_match_info_fetch (info, 2);
++    if (!id || !seq)
++        return;
++    command = g_strdup_printf ("+EAIC=0,%s,%s", id, seq);
++    mm_obj_dbg (self, "approving incoming call %s (seq %s)", id, seq);
++    mm_base_modem_at_command (MM_BASE_MODEM (self), command, 5, FALSE, NULL, NULL);
++}
++
+ static void
+ set_voice_unsolicited_events_handlers (MMIfaceModemVoice *self,
+                                        gboolean enable,
+@@ -8134,6 +8197,7 @@
+     g_autoptr(GRegex)  ring_regex = NULL;
+     g_autoptr(GRegex)  clip_regex = NULL;
+     g_autoptr(GRegex)  ccwa_regex = NULL;
++    g_autoptr(GRegex)  eaic_regex = NULL;
+     guint              i;
+     GTask             *task;
+ 
+@@ -8141,6 +8205,9 @@
+     ring_regex  = mm_voice_ring_regex_get ();
+     clip_regex  = mm_voice_clip_regex_get ();
+     ccwa_regex  = mm_voice_ccwa_regex_get ();
++    if (bf7_is_mtk_voice (MM_BROADBAND_MODEM (self)))
++        eaic_regex = g_regex_new ("\\r\\n\\+EAIC:\\s*(\\d+),\\s*(?:\"[^\"]*\"|[^,]*),\\s*\\d*,\\s*\\d*,\\s*(\\d+)[^\\r\\n]*\\r\\n",
++                                  G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+     ports[0] = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+     ports[1] = mm_base_modem_peek_port_secondary (MM_BASE_MODEM (self));
+ 
+@@ -8177,6 +8244,13 @@
+             enable ? (MMPortSerialAtUnsolicitedMsgFn) ccwa_received : NULL,
+             enable ? self : NULL,
+             NULL);
++        if (eaic_regex)
++            mm_port_serial_at_add_unsolicited_msg_handler (
++                ports[i],
++                eaic_regex,
++                enable ? (MMPortSerialAtUnsolicitedMsgFn) bf7_eaic_received : NULL,
++                enable ? self : NULL,
++                NULL);
+     }
+ 
+     task = g_task_new (self, NULL, callback, user_data);

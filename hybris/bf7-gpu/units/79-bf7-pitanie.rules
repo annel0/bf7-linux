@@ -1,0 +1,16 @@
+# BF7: UPower должен видеть, что кабель выдернули.
+#
+# 2026-09-24: без кабеля телефон час не засыпал — UPower считал его «от сети»:
+# у power_supply «usb» и «mtk-master-charger» online=1 в его памяти, а в sysfs
+# уже 0. Драйверы MediaTek при подключении/отключении шлют событие только от
+# mtk_charger_type и battery, а от usb и зарядников — нет, и UPower их не
+# перечитывает. gsd-power на «сети» применяет правило «не усыплять».
+#
+# Здесь: при изменении mtk_charger_type или battery — разослать «change» и от
+# usb и зарядников, чтобы UPower обновил их.
+#
+# «$$d», а не «$d»: в RUN udev сам подставляет $-переменные. С одним «$» udev
+# отвергал правило целиком («invalid substitution type», 2026-09-30) — оно
+# не работало ни разу с 24.09.
+ACTION=="change", SUBSYSTEM=="power_supply", KERNEL=="mtk_charger_type|battery", \
+  RUN+="/bin/sh -c 'for d in usb mtk-master-charger mtk-slave-charger ac; do [ -w /sys/class/power_supply/$$d/uevent ] && echo change > /sys/class/power_supply/$$d/uevent; done'"

@@ -1,0 +1,9 @@
+[Unit]
+Description=BF7: время из NTP в RTC раз в 12 часов
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=12h
+
+[Install]
+WantedBy=timers.target

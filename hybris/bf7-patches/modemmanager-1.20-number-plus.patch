@@ -1,0 +1,85 @@
+Index: modemmanager-1.20.4/src/mm-broadband-modem.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-broadband-modem.c	2026-09-24 10:48:01.481267657 +0300
++++ modemmanager-1.20.4/src/mm-broadband-modem.c	2026-09-25 12:29:01.440221344 +0300
+@@ -8068,6 +8068,12 @@
+     call_info.direction = MM_CALL_DIRECTION_INCOMING;
+     call_info.state     = MM_CALL_STATE_WAITING;
+     call_info.number    = mm_get_string_unquoted_from_match_info (info, 1);
++    {
++        guint type = 0;
++
++        if (mm_get_uint_from_match_info (info, 2, &type))
++            call_info.number = mm_bf7_number_with_plus (call_info.number, type);
++    }
+ 
+     mm_obj_dbg (self, "call waiting (%s)", call_info.number);
+     mm_iface_modem_voice_report_call (MM_IFACE_MODEM_VOICE (self), &call_info);
+@@ -8156,6 +8162,12 @@
+     call_info.direction = MM_CALL_DIRECTION_INCOMING;
+     call_info.state     = MM_CALL_STATE_RINGING_IN;
+     call_info.number    = mm_get_string_unquoted_from_match_info (info, 1);
++    {
++        guint type = 0;
++
++        if (mm_get_uint_from_match_info (info, 2, &type))
++            call_info.number = mm_bf7_number_with_plus (call_info.number, type);
++    }
+ 
+     mm_obj_dbg (self, "ringing (%s)", call_info.number);
+     mm_iface_modem_voice_report_call (MM_IFACE_MODEM_VOICE (self), &call_info);
+Index: modemmanager-1.20.4/src/mm-modem-helpers.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-modem-helpers.c	2022-12-31 16:42:31.000000000 +0300
++++ modemmanager-1.20.4/src/mm-modem-helpers.c	2026-09-25 12:29:01.432221311 +0300
+@@ -479,6 +479,22 @@
+                         NULL);
+ }
+ 
++/* BF7: 3GPP TS 27.007 type 145 = international number; some modems (MediaTek)
++ * report it without the leading '+', and the same caller then shows up as two
++ * different numbers (incoming "7978...", outgoing "+7978...") in the call log
++ * and doesn't match the contact. */
++gchar *
++mm_bf7_number_with_plus (gchar *number, guint type)
++{
++    gchar *fixed;
++
++    if (!number || !number[0] || number[0] == '+' || type != 145)
++        return number;
++    fixed = g_strdup_printf ("+%s", number);
++    g_free (number);
++    return fixed;
++}
++
+ GRegex *
+ mm_voice_clip_regex_get (void)
+ {
+@@ -629,8 +645,14 @@
+             goto next;
+         }
+ 
+-        if (g_match_info_get_match_count (match_info) >= 7)
++        if (g_match_info_get_match_count (match_info) >= 7) {
++            guint type = 0;
++
+             call_info->number = mm_get_string_unquoted_from_match_info (match_info, 6);
++            if (g_match_info_get_match_count (match_info) >= 8 &&
++                mm_get_uint_from_match_info (match_info, 7, &type))
++                call_info->number = mm_bf7_number_with_plus (call_info->number, type);
++        }
+ 
+         list = g_list_append (list, call_info);
+         call_info = NULL;
+Index: modemmanager-1.20.4/src/mm-modem-helpers.h
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-modem-helpers.h	2022-12-31 16:42:31.000000000 +0300
++++ modemmanager-1.20.4/src/mm-modem-helpers.h	2026-09-25 12:29:01.432221311 +0300
+@@ -85,6 +85,7 @@
+ 
+ GRegex *mm_voice_ring_regex_get  (void);
+ GRegex *mm_voice_cring_regex_get (void);
++gchar *mm_bf7_number_with_plus (gchar *number, guint type);
+ GRegex *mm_voice_clip_regex_get  (void);
+ GRegex *mm_voice_ccwa_regex_get  (void);
+ 

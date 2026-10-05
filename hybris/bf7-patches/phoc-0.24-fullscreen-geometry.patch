@@ -1,0 +1,19 @@
+Index: phoc-pkg/src/xdg_shell.c
+===================================================================
+--- a/src/xdg_shell.c	2023-01-31 14:36:25.000000000 +0300
++++ b/src/xdg_shell.c	2026-09-24 09:32:25.724350666 +0300
+@@ -298,7 +298,13 @@
+ 
+ 	struct wlr_box geometry;
+         phoc_xdg_surface_get_geometry (phoc_surface, &geometry);
+-	if (phoc_surface->saved_geometry.x != geometry.x || phoc_surface->saved_geometry.y != geometry.y) {
++	/* BF7: keeping the geometry origin in place is right for floating views
++	 * only. A fullscreen or maximized view is pinned to the output: shifting
++	 * it left it offset for good - RetroArch (libdecor titlebar) went
++	 * fullscreen with geometry (0,-24,...), then set (0,0,...), and every
++	 * touch landed 24 logical px lower than the picture. */
++	if ((phoc_surface->saved_geometry.x != geometry.x || phoc_surface->saved_geometry.y != geometry.y) &&
++	    !view_is_fullscreen (view) && !view_is_maximized (view)) {
+ 		view_update_position(view,
+ 		                     view->box.x + (phoc_surface->saved_geometry.x - geometry.x) * view->scale,
+ 		                     view->box.y + (phoc_surface->saved_geometry.y - geometry.y) * view->scale);

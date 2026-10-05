@@ -1,0 +1,29 @@
+[Unit]
+# Демон аппаратного декодирования видео.
+#
+# Живёт отдельным 32-битным процессом: настоящий драйвер кодека на этом
+# устройстве существует только в 32 битах (/vendor/lib/libvcodecdrv.so).
+# Наружу он выставлен сокетом, к которому ходит наш драйвер VA-API.
+#
+# Перезапуск обязателен: если клиента убить жёстко посреди декодирования,
+# демон уходит вместе с ним, и следующий проигрыватель получает «демон
+# декодирования недоступен».
+Description=Аппаратное декодирование видео (MediaTek Codec2)
+After=bf7-android-mounts.service bf7-binderfs.service
+Requires=bf7-android-mounts.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/codec2
+Environment=LD_LIBRARY_PATH=/vendor.local/lib:/vendor/lib:/vendor/lib/hw:/system/lib
+Environment="LD_PRELOAD=/vendor.local/lib/libbf7prop.so /vendor.local/lib/libbf7log.so"
+ExecStart=/root/codec2/bf7-videod
+Restart=always
+RestartSec=2
+# Сокет создаётся самим демоном; старый после падения надо убрать.
+ExecStartPre=-/bin/rm -f /run/bf7-video.sock
+StandardOutput=append:/tmp/videod.log
+StandardError=append:/tmp/videod.log
+
+[Install]
+WantedBy=multi-user.target

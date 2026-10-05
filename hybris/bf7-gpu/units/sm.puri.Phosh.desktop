@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Phosh
+Comment=Оболочка телефона (BF7: поднимается разблокированной)
+Exec=/usr/libexec/phosh --unlocked
+NoDisplay=true
+X-GNOME-AutoRestart=false
+X-GNOME-Autostart-Notify=true
+X-GNOME-AutoRestart-Delay=2
+X-GNOME-Provides=panel;windowmanager;

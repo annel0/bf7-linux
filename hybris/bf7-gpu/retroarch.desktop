@@ -1,0 +1,15 @@
+[Desktop Entry]
+Version=1.0
+Name=RetroArch
+GenericName=Frontend for the libretro API
+Type=Application
+Comment=Frontend for emulators, game engines and media players
+Comment[ru]=Эмуляторы старых приставок (Vulkan и GL)
+Icon=retroarch
+Exec=/usr/local/bin/bf7-retroarch
+Terminal=false
+StartupNotify=false
+StartupWMClass=retroarch
+Keywords=multi;engine;emulator;xmb;
+Categories=Game;Emulator;
+X-Purism-FormFactor=Workstation;Mobile;

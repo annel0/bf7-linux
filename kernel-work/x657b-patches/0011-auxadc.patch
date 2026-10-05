@@ -1,0 +1,211 @@
+From c18d365e0243b6b72b54de3798f4082329a56fd7 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Tue, 22 Sep 2026 23:37:32 +0300
+Subject: [PATCH 11/40] =?UTF-8?q?=D0=96=D1=83=D1=80=D0=BD=D0=B0=D0=BB=20?=
+ =?UTF-8?q?=D1=8F=D0=B4=D1=80=D0=B0:=20=D0=B7=D0=B0=D1=80=D1=8F=D0=B4?=
+ =?UTF-8?q?=D0=BD=D0=B8=D0=BA,=20=D1=82=D0=B5=D1=80=D0=BC=D0=BE=D0=B4?=
+ =?UTF-8?q?=D0=B0=D1=82=D1=87=D0=B8=D0=BA=D0=B8=20=D0=B8=20auxadc=20=D0=B1?=
+ =?UTF-8?q?=D0=BE=D0=BB=D1=8C=D1=88=D0=B5=20=D0=B5=D0=B3=D0=BE=20=D0=BD?=
+ =?UTF-8?q?=D0=B5=20=D0=B7=D0=B0=D0=BB=D0=B8=D0=B2=D0=B0=D1=8E=D1=82?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Было около тысячи строк в минуту, стало около двухсот.
+
+mtk_charger: charger_init_algo зовётся по кругу, пока не найдёт
+primary_chg, которого на плате нет (заряд ведёт вендорский демон). Но до
+этой проверки она регистрирует оповещателей pe4/pd — и на каждом круге
+тех же самых повторно. srcu_notifier_chain_register отвечал WARN_ON с
+полным дампом регистров каждые пять секунд. Теперь оповещатели ставятся
+один раз, а бесплодные попытки после шести громких идут молча раз в минуту.
+
+mtk_ts_pmic: probe безусловно включал «отладочный» вывод, а тот идёт
+через pr_notice, то есть в журнал по-настоящему — около сотни строк в
+минуту про опрос tsbuck1/tsbuck2. Выключен; вернуть можно через
+/proc/driver/thermal/tzpmic_log.
+
+mt635x-auxadc: каждое чтение канала шло dev_info; переведено на dev_dbg.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/iio/adc/mt635x-auxadc.c               |  8 ++-
+ .../common/thermal_zones/mtk_ts_pmic.c        | 17 ++++-
+ drivers/power/supply/mtk_charger.c            | 62 ++++++++++++++++---
+ 3 files changed, 78 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/iio/adc/mt635x-auxadc.c b/drivers/iio/adc/mt635x-auxadc.c
+index ba79a62cb..938199210 100644
+--- a/drivers/iio/adc/mt635x-auxadc.c
++++ b/drivers/iio/adc/mt635x-auxadc.c
+@@ -877,8 +877,14 @@ static int mt635x_auxadc_read_raw(struct iio_dev *indio_dev,
+ 	}
+ 	if (chan->channel == AUXADC_IMP)
+ 		ret = IIO_VAL_INT_MULTIPLE;
++	/*
++	 * BF7: было dev_info — каждое чтение любого канала попадало в журнал.
++	 * Ограничитель частоты спасал лишь отчасти: набегало больше десятка
++	 * строк в минуту про один и тот же VBIF. Оставлено на dev_dbg: при
++	 * нужде включается динамической отладкой, не пересобирая ядро.
++	 */
+ 	if (__ratelimit(&ratelimit)) {
+-		dev_info(adc_dev->dev,
++		dev_dbg(adc_dev->dev,
+ 			"name:%s, channel=%d, adc_out=0x%x, adc_result=%d\n",
+ 			auxadc_chan->ch_name, auxadc_chan->ch_num,
+ 			auxadc_out, *val);
+diff --git a/drivers/misc/mediatek/thermal/common/thermal_zones/mtk_ts_pmic.c b/drivers/misc/mediatek/thermal/common/thermal_zones/mtk_ts_pmic.c
+index 203a34d33..0005547c9 100644
+--- a/drivers/misc/mediatek/thermal/common/thermal_zones/mtk_ts_pmic.c
++++ b/drivers/misc/mediatek/thermal/common/thermal_zones/mtk_ts_pmic.c
+@@ -673,7 +673,22 @@ static int mtk_ts_pmic_probe(struct platform_device *pdev)
+ 	struct proc_dir_entry *mtktspmic_dir = NULL;
+ 	struct mt6397_chip *chip;
+ 
+-	mtktspmic_debug_log = 1;
++	/*
++	 * BF7: было 1 — и это заливало журнал.
++	 *
++	 * mtktspmic_dprintk пишет через pr_notice, а не pr_debug, так что эта
++	 * «отладка» попадала в журнал по-настоящему: около сотни строк в минуту
++	 * про опрос датчиков tsbuck1/tsbuck2. Полезного в них нет — температура
++	 * и так читается через /sys/class/thermal.
++	 *
++	 * Ловушка, на которой я споткнулся: начальное значение переменной в
++	 * mtk_pmic_efuse.c ни на что не влияет, потому что здесь, в probe, её
++	 * безусловно переписывают. Вдобавок сперва я правил thermal/mt6765, а
++	 * собирается thermal/mt6761 — смотреть, какой .o лежит в сборке.
++	 *
++	 * Включить обратно без пересборки: echo 1 > /proc/driver/thermal/tzpmic_log
++	 */
++	mtktspmic_debug_log = 0;
+ 
+ 	chip = (struct mt6397_chip *)dev_get_drvdata(pdev->dev.parent);
+ 	mtktspmic_info("[%s]\n", __func__);
+diff --git a/drivers/power/supply/mtk_charger.c b/drivers/power/supply/mtk_charger.c
+index 57aaa9bed..49ff3bd0b 100644
+--- a/drivers/power/supply/mtk_charger.c
++++ b/drivers/power/supply/mtk_charger.c
+@@ -1338,10 +1338,28 @@ static void charger_check_status(struct mtk_charger *info)
+ 	info->can_charging = charging;
+ }
+ 
++/*
++ * BF7: оповещателей регистрируем один раз за жизнь.
++ *
++ * Здесь была настоящая ловушка. Эта работа зовётся из charger_routine_thread
++ * по кругу, пока не удастся, а удаться ей не может: на нашей плате нет
++ * "primary_chg" — зарядом заведует вендорский демон из /vendor, не ядро.
++ * Но до этой проверки работа успевает зарегистрировать оповещателей у всех
++ * найденных алгоритмов (pe4, pd), а на следующем круге регистрирует тех же
++ * самых повторно. srcu_notifier_chain_register честно ругается WARN_ON на
++ * повторную запись — и вываливает полный дамп регистров.
++ *
++ * Стоило это дорого: каждые пять секунд около тридцати строк, почти
++ * половина всего журнала ядра. Не поломка работы, но изрядный износ флеша
++ * и шум, в котором тонут настоящие сообщения.
++ */
++static bool bf7_opoveshchateli_postavleny;
++
+ static bool charger_init_algo(struct mtk_charger *info)
+ {
+ 	struct chg_alg_device *alg;
+ 	int idx = 0;
++	bool stavit = !bf7_opoveshchateli_postavleny;
+ 
+ 	alg = get_chg_alg_by_name("pe4");
+ 	info->alg[idx] = alg;
+@@ -1351,7 +1369,8 @@ static bool charger_init_algo(struct mtk_charger *info)
+ 		chr_err("get pe4 success\n");
+ 		alg->config = info->config;
+ 		chg_alg_init_algo(alg);
+-		register_chg_alg_notifier(alg, &info->chg_alg_nb);
++		if (stavit)
++			register_chg_alg_notifier(alg, &info->chg_alg_nb);
+ 	}
+ 	idx++;
+ 
+@@ -1363,7 +1382,8 @@ static bool charger_init_algo(struct mtk_charger *info)
+ 		chr_err("get pd success\n");
+ 		alg->config = info->config;
+ 		chg_alg_init_algo(alg);
+-		register_chg_alg_notifier(alg, &info->chg_alg_nb);
++		if (stavit)
++			register_chg_alg_notifier(alg, &info->chg_alg_nb);
+ 	}
+ 	idx++;
+ 
+@@ -1375,7 +1395,8 @@ static bool charger_init_algo(struct mtk_charger *info)
+ 		chr_err("get pe2 success\n");
+ 		alg->config = info->config;
+ 		chg_alg_init_algo(alg);
+-		register_chg_alg_notifier(alg, &info->chg_alg_nb);
++		if (stavit)
++			register_chg_alg_notifier(alg, &info->chg_alg_nb);
+ 	}
+ 	idx++;
+ 
+@@ -1387,9 +1408,13 @@ static bool charger_init_algo(struct mtk_charger *info)
+ 		chr_err("get pe success\n");
+ 		alg->config = info->config;
+ 		chg_alg_init_algo(alg);
+-		register_chg_alg_notifier(alg, &info->chg_alg_nb);
++		if (stavit)
++			register_chg_alg_notifier(alg, &info->chg_alg_nb);
+ 	}
+ 
++	if (stavit)
++		bf7_opoveshchateli_postavleny = true;
++
+ 	info->chg1_dev = get_charger_by_name("primary_chg");
+ 	if (info->chg1_dev)
+ 		chr_err("Found primary charger\n");
+@@ -1552,6 +1577,9 @@ static char *dump_charger_type(int type)
+ 	}
+ }
+ 
++/* Сколько раз говорить вслух, прежде чем перейти на редкие молчаливые попытки. */
++#define BF7_POPYTOK_GROMKO 6
++
+ static int charger_routine_thread(void *arg)
+ {
+ 	struct mtk_charger *info = arg;
+@@ -1563,12 +1591,32 @@ static int charger_routine_thread(void *arg)
+ 		wait_event(info->wait_que,
+ 			(info->charger_thread_timeout == true));
+ 
++		/*
++		 * BF7: бесплодные попытки замедляем.
++		 *
++		 * На нашей плате "primary_chg" не появится никогда — заряд ведёт
++		 * вендорский демон, а не ядро. Прежний вид долбился каждые пять
++		 * секунд до скончания века и на каждом круге писал в журнал.
++		 * Оставляем первые попытки частыми (вдруг устройство просто
++		 * запаздывает), дальше переходим на раз в минуту и умолкаем.
++		 */
+ 		while (is_module_init_done == false) {
+-			if (charger_init_algo(info) == true)
++			static unsigned int bf7_popytok;
++
++			if (charger_init_algo(info) == true) {
+ 				is_module_init_done = true;
+-			else {
+-				chr_err("charger_init fail\n");
++				break;
++			}
++
++			bf7_popytok++;
++			if (bf7_popytok <= BF7_POPYTOK_GROMKO) {
++				chr_err("charger_init fail (попытка %u)\n",
++					bf7_popytok);
+ 				msleep(5000);
++			} else {
++				if (bf7_popytok == BF7_POPYTOK_GROMKO + 1)
++					chr_err("charger_init не удаётся, дальше пробую молча раз в минуту\n");
++				msleep(60000);
+ 			}
+ 		}
+ 
+-- 
+2.55.0
+

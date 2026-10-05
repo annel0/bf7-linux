@@ -1,0 +1,48 @@
+[Unit]
+StartLimitIntervalSec=180
+StartLimitBurst=4
+# BF7: поднять Bluetooth.
+#
+# Три части, и каждая нужна.
+#
+# 1. bt_drv — драйвер MediaTek, отдаёт HCI через символьный узел /dev/stpbt.
+#    Собран из донора mt6761 с макросом MTK_WCN_WMT_STP_EXP_SYMBOL_ABSTRACT:
+#    без него заголовок stp_exp.h идёт по ветке #else и не компилируется.
+# 2. hci_vhci, rfcomm, hidp — виртуальный транспорт и профили. Собраны
+#    модулями против прошитого ядра, перепрошивка не понадобилась.
+# 3. bf7-btbridge — перекладывает пакеты H4 между /dev/stpbt и /dev/vhci и
+#    снимает у чипа заявку на умение, которого у него нет (см. сам мост).
+#
+# Поднимается после сеанса, как Wi-Fi и камера: экрану ждать радио незачем.
+Description=Bluetooth BF7 (драйвер MediaTek через виртуальный HCI)
+# После bf7-wifi: драйвер bt_drv зависит от wmt_drv, а его грузит подъём
+# Wi-Fi. Без этого порядка insmod отвечает «Unknown symbol in module».
+After=bf7-phosh.service bf7-wifi.service
+Requires=bf7-wifi.service
+Before=bluetooth.service
+Wants=bluetooth.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/bf7-bt-prepare
+ExecStart=/usr/local/sbin/bf7-btbridge
+# Перезапуска нет нарочно. Драйвер MediaTek держит чтение непрерываемым: если
+# чип после неудачной попытки отвечает EIO, процесс моста застревает так, что
+# его не берёт даже SIGKILL. Перезапуск в этом случае только плодит застрявшие
+# процессы и заново портит чип. Если Bluetooth не поднялся — помогает
+# перезагрузка, и это записано в дев-логе.
+# Перезапуск разрешён: мост научился закрывать оба описателя по сигналу, так
+# что висящей остановки, как 2026-09-22 ночью, больше не будет. Ограничение по
+# числу попыток — чтобы при настоящей поломке не молотить бесконечно.
+Restart=on-failure
+RestartSec=15
+# Подстраховка. Мост закрывает узлы по сигналу сам, но если он когда-нибудь
+# всё же не выйдет, выключение телефона не должно вставать намертво: однажды
+# система провисела в «stopping» тридцать пять минут ровно из-за этого.
+TimeoutStopSec=8
+KillMode=mixed
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,17 @@
+[Unit]
+# BF7: уснуть снова после непрошеного пробуждения на батарее (подробности —
+# в самом /usr/local/bin/bf7-dosyp).
+Description=Сон BF7: снова уснуть после пробуждения без человека
+After=bf7-phosh.service
+Wants=bf7-phosh.service
+
+[Service]
+Type=simple
+Environment=HOME=/root
+Environment=XDG_RUNTIME_DIR=/run/bf7-phosh
+ExecStart=/usr/local/bin/bf7-dosyp
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

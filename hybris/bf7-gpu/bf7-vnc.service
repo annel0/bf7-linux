@@ -1,0 +1,15 @@
+[Unit]
+Description=VNC-зеркало панели телефона (и ввод касаний с ПК)
+After=bf7-phosh.service
+
+[Service]
+Type=simple
+# xrefresh нужен, чтобы будить рабочий стол на новый кадр.
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/root/.Xauthority
+ExecStart=/usr/bin/python3 /usr/local/sbin/bf7vnc.py 5900
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

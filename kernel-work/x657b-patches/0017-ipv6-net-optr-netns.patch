@@ -1,0 +1,98 @@
+From b6d8ee80797f720fbd2ae71b4b9fd66849bb9eed Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 08:26:23 +0300
+Subject: [PATCH 17/40] =?UTF-8?q?ipv6:=20=D1=80=D0=B5=D0=B3=D0=B8=D1=81?=
+ =?UTF-8?q?=D1=82=D1=80=D0=B8=D1=80=D0=BE=D0=B2=D0=B0=D1=82=D1=8C=20net/op?=
+ =?UTF-8?q?tr=20=D0=BE=D0=B4=D0=B8=D0=BD=20=D1=80=D0=B0=D0=B7,=20=D0=B0=20?=
+ =?UTF-8?q?=D0=BD=D0=B5=20=D0=B2=20=D0=BA=D0=B0=D0=B6=D0=B4=D0=BE=D0=BC=20?=
+ =?UTF-8?q?netns?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+MediaTek регистрировал таблицу в ipv6_sysctl_net_init в локальную
+переменную и никогда не снимал: при каждом уничтожении сетевого
+пространства (службы systemd с PrivateNetwork) таблица утекала, а
+retire_sysctl_set выдавал WARNING со слепком регистров. Найдено
+трассировкой register_net_sysctl/unregister_sysctl_table вокруг
+unshare -n: 52 регистрации, 51 снятие. Значение глобальное, так что
+достаточно init_net. После: 0 WARNING, /proc/sys/net/optr на месте.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ net/ipv6/sysctl_net_ipv6.c | 25 ++++++++++++++++++++-----
+ 1 file changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/net/ipv6/sysctl_net_ipv6.c b/net/ipv6/sysctl_net_ipv6.c
+index b8fdfd2c9..19ff31b74 100644
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@ -213,7 +213,6 @@ static int __net_init ipv6_sysctl_net_init(struct net *net)
+ 	struct ctl_table *ipv6_table;
+ 	struct ctl_table *ipv6_route_table;
+ 	struct ctl_table *ipv6_icmp_table;
+-	struct ctl_table_header *vzw_hdr;
+ 	int err;
+ 
+ 	err = -ENOMEM;
+@@ -250,10 +249,6 @@ static int __net_init ipv6_sysctl_net_init(struct net *net)
+ 	if (!net->ipv6.sysctl.hdr)
+ 		goto out_ipv6_icmp_table;
+ 
+-	vzw_hdr = register_net_sysctl(net, "net", net_table);
+-	if (!vzw_hdr)
+-		pr_info("[mtk_net] register net sysctl optr is fail.\n");
+-
+ 	net->ipv6.sysctl.route_hdr =
+ 		register_net_sysctl(net, "net/ipv6/route", ipv6_route_table);
+ 	if (!net->ipv6.sysctl.route_hdr)
+@@ -306,6 +301,18 @@ static struct pernet_operations ipv6_sysctl_net_ops = {
+ 
+ static struct ctl_table_header *ip6_header;
+ 
++/*
++ * BF7: MediaTek регистрировал net/optr в ipv6_sysctl_net_init — то есть в
++ * КАЖДОМ сетевом пространстве имён, в локальную переменную, и никогда не
++ * снимал. Всякий раз, когда пространство умирало (systemd-localed,
++ * -hostnamed и прочие службы с PrivateNetwork=yes при каждом выходе),
++ * таблица утекала, а sysctl_net_exit → retire_sysctl_set выдавал WARNING
++ * со слепком регистров. Значение одно на всю систему (sysctl_optr —
++ * глобальная переменная), поэтому регистрируем один раз, в init_net, рядом
++ * с ip6_header — как и было видно из /proc/sys/net/optr в корне.
++ */
++static struct ctl_table_header *bf7_optr_header;
++
+ int ipv6_sysctl_register(void)
+ {
+ 	int err = -ENOMEM;
+@@ -314,6 +321,10 @@ int ipv6_sysctl_register(void)
+ 	if (!ip6_header)
+ 		goto out;
+ 
++	bf7_optr_header = register_net_sysctl(&init_net, "net", net_table);
++	if (!bf7_optr_header)
++		pr_info("[mtk_net] register net sysctl optr is fail.\n");
++
+ 	err = register_pernet_subsys(&ipv6_sysctl_net_ops);
+ 	if (err)
+ 		goto err_pernet;
+@@ -321,12 +332,16 @@ int ipv6_sysctl_register(void)
+ 	return err;
+ 
+ err_pernet:
++	if (bf7_optr_header)
++		unregister_net_sysctl_table(bf7_optr_header);
+ 	unregister_net_sysctl_table(ip6_header);
+ 	goto out;
+ }
+ 
+ void ipv6_sysctl_unregister(void)
+ {
++	if (bf7_optr_header)
++		unregister_net_sysctl_table(bf7_optr_header);
+ 	unregister_net_sysctl_table(ip6_header);
+ 	unregister_pernet_subsys(&ipv6_sysctl_net_ops);
+ }
+-- 
+2.55.0
+

@@ -1,0 +1,24 @@
+#!/bin/sh
+# BF7: сказать собеседнику в идущий разговор синтезированной речью.
+#   bf7-skazat "текст"
+# Синтез: Festival с русским голосом msu_ru_nsh_clunits (пакет festvox-ru,
+# склеен из записанной речи — живее), запасной — espeak-ng (хозяин: «калл»).
+# Дальше 48 кГц стерео s16le -> bf7-rech «igraj» через канал команд
+# bf7-zvonki. HAL MediaTek в разговоре отдаёт основной выход модему как
+# фоновый звук — его слышит собеседник. Вне разговора ничего не делает.
+set -eu
+[ $# -ge 1 ] || { echo "вызов: bf7-skazat \"текст\"" >&2; exit 2; }
+kanal=/run/bf7-rech.cmd
+[ -p "$kanal" ] || { echo "bf7-skazat: нет $kanal — bf7-zvonki не запущен" >&2; exit 1; }
+wav=$(mktemp /run/bf7-skazat.XXXXXX.wav)
+raw=/run/bf7-skazat.raw
+if command -v text2wave >/dev/null 2>&1 &&
+   printf '%s\n' "$*" | text2wave -eval "(voice_msu_ru_nsh_clunits)" -o "$wav" 2>/dev/null &&
+   [ -s "$wav" ]; then
+	:
+else
+	espeak-ng -v ru -s 140 -w "$wav" "$*"
+fi
+ffmpeg -hide_banner -loglevel error -y -i "$wav" -ar 48000 -ac 2 -f s16le "$raw"
+rm -f "$wav"
+echo "igraj $raw" > "$kanal"

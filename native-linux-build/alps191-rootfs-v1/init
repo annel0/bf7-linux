@@ -1,0 +1,208 @@
+#!/bin/busybox sh
+# BF7 ALPS191 rootfs trial v1: bring up USB RNDIS+ACM recovery channels, then
+# hand off to the persistent Debian root on mmcblk0p48 (READ-ONLY on the first
+# runs).  Derived from initramfs-root/init (known-good v20) with two deliberate
+# differences:
+#   * NO bf7-mark-boot-success: slot A must stay "successful=0" so the LK A/B
+#     fallback to the known-good slot B keeps working;
+#   * root is checked with e2fsck here and mounted ro WITH its journal (the
+#     old ro,noload survived systemd's rw remount and ran the root unjournaled,
+#     see the MOUNT_OPTS comment below).
+# Kernel cmdline switches: bf7.rootrw=1 -> mount rw; bf7.noroot=1 -> stay in
+# the initramfs (RNDIS/ACM shell only).
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+# The ALPS kernel has devtmpfs; keep it, fall back to tmpfs.
+if ! mount -t devtmpfs -o mode=0755,nosuid devtmpfs /dev 2>/dev/null; then
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /dev
+    mount -o remount,dev /dev
+fi
+mkdir -p /dev/pts /dev/shm /run /tmp /sys/kernel/config /newroot
+ensure_char_device() {
+    path=$1 major=$2 minor=$3 mode=$4
+    [ -c "$path" ] || { rm -f "$path"; mknod "$path" c "$major" "$minor"; }
+    chmod "$mode" "$path"
+}
+ensure_char_device /dev/console 5 1 600
+ensure_char_device /dev/null    1 3 666
+ensure_char_device /dev/zero    1 5 666
+ensure_char_device /dev/full    1 7 666
+ensure_char_device /dev/tty     5 0 666
+ensure_char_device /dev/random  1 8 666
+ensure_char_device /dev/urandom 1 9 666
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+ln -sf pts/ptmx /dev/ptmx
+
+log() { printf 'BF7-ROOTFS: %s\n' "$*" > /dev/kmsg 2>/dev/null || true; }
+CMDLINE=$(cat /proc/cmdline)
+has_opt() { case " $CMDLINE " in *" $1 "*) return 0 ;; esac; return 1; }
+
+# USB composite: RNDIS (recovery network) + CDC-ACM (kernel console + tty).
+mount -t configfs none /sys/kernel/config 2>/dev/null || true
+G=/sys/kernel/config/usb_gadget/bf7_native
+mkdir -p "$G/strings/0x409" "$G/configs/c.1/strings/0x409" \
+    "$G/functions/rndis.usb0" "$G/functions/acm.usb0"
+echo 0x1d6b > "$G/idVendor"
+echo 0x0111 > "$G/idProduct"
+echo 0x0100 > "$G/bcdDevice"
+echo 0x0200 > "$G/bcdUSB"
+echo BF7ALPSROOT1 > "$G/strings/0x409/serialnumber"
+echo TECNO > "$G/strings/0x409/manufacturer"
+echo 'BF7 ALPS191 native Debian' > "$G/strings/0x409/product"
+echo 'RNDIS+ACM recovery' > "$G/configs/c.1/strings/0x409/configuration"
+echo 0xc0 > "$G/configs/c.1/bmAttributes"
+echo 250 > "$G/configs/c.1/MaxPower"
+# Скобки обязательны: «> файл» открывается раньше, чем действует
+# «2>/dev/null», и отказ («Permission denied») печатался на экран каждой
+# загрузки — хозяин принял его за причину зависания. Имя всё равно не
+# меняется: интерфейс остаётся rndis0, им и пользуемся.
+{ echo usb0 > "$G/functions/rndis.usb0/ifname"; } 2>/dev/null || true
+ln -s "$G/functions/rndis.usb0" "$G/configs/c.1/rndis.usb0" 2>/dev/null || true
+ln -s "$G/functions/acm.usb0" "$G/configs/c.1/acm.usb0" 2>/dev/null || true
+echo musb-hdrc > "$G/UDC"
+
+for n in $(seq 1 20); do
+    if [ -d /sys/class/net/rndis0 ]; then
+        ip link set rndis0 up
+        ip addr replace 192.168.7.2/24 dev rndis0
+        log "RNDIS ready on 192.168.7.2"
+        break
+    fi
+    sleep 1
+done
+
+# Persistent recovery channels that survive switch_root (busybox-static is
+# fully mapped, so deleting the initramfs does not kill it).  This mirrors the
+# known-good image: passwordless root telnet on RNDIS 2323 plus a plain tty
+# shell on USB ACM.  Debian's own sshd is the normal path once it is up.
+if [ -x /bin/busybox-static ]; then
+    # setsid + no controlling tty: survives the vhangup() that systemd's
+    # serial-getty@ttyGS0 performs on the console after switch_root.
+    if has_opt bf7.noroot=1; then
+        # The initramfs stays mounted here, so /bin/busybox-static keeps
+        # resolving and a restart loop is safe.
+        /bin/busybox-static setsid /bin/busybox-static sh -c '
+            while :; do
+                /bin/busybox-static telnetd -F -K -b 192.168.7.2:2323 -l /bin/sh
+                sleep 1
+            done' </dev/null >/dev/null 2>&1 &
+    else
+        # After switch_root the initramfs is gone: /bin/busybox-static still
+        # runs (it is fully mapped) but the PATH entry is deleted, so every
+        # exec from a restart loop fails and the shell spins.  Measured on the
+        # 2026-09-14 trial: 43% of a core and 19k rescheduling IPIs per second,
+        # which looked exactly like a kernel problem and was not one.  Start
+        # telnetd once instead; Debian's own bf7-recovery-telnet.service on
+        # 2324 and sshd are the channels that survive from there.
+        /bin/busybox-static setsid /bin/busybox-static telnetd \
+            -F -K -b 192.168.7.2:2323 -l /bin/sh </dev/null >/dev/null 2>&1 &
+    fi
+    log 'recovery telnet 192.168.7.2:2323 started (detached)'
+fi
+
+[ -b /dev/mmcblk0p48 ] || mknod /dev/mmcblk0p48 b 259 16
+
+if has_opt bf7.noroot=1; then
+    # Kernel-only mode: no Debian, no systemd, no sshd.  Just the kernel plus
+    # busybox, so anything observed here is the kernel's behaviour and not the
+    # OEM-era userspace.  Access: telnet 192.168.7.2:2323 and the USB ACM tty.
+    log "bf7.noroot=1: kernel-only mode, staying in initramfs"
+    [ -x /bin/busybox-static ] && [ -c /dev/ttyGS0 ] && \
+        /bin/busybox-static setsid /bin/busybox-static sh -c \
+            'while :; do /bin/busybox-static getty -n -l /bin/sh 115200 ttyGS0; sleep 2; done' \
+            </dev/null >/dev/null 2>&1 &
+    mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+    mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+    # Real SSH on the RNDIS link, if the overlay provided dropbear.
+    if [ -x /usr/sbin/dropbear ]; then
+        mkdir -p /etc/dropbear /root/.ssh
+        [ -f /etc/dropbear/dropbear_ed25519_host_key ] || \
+            /usr/bin/dropbearkey -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1
+        chmod 700 /root/.ssh 2>/dev/null; chmod 600 /root/.ssh/authorized_keys 2>/dev/null
+        /usr/sbin/dropbear -R -E -p 192.168.7.2:22 >/dev/null 2>&1 &
+        log "dropbear ssh on 192.168.7.2:22"
+    fi
+    log "kernel-only mode ready"
+    while :; do sleep 3600; done
+fi
+
+# Проверка корня перед монтированием.
+#
+# Зачем здесь, а не через systemd: корень монтируется прямо тут, и единственный
+# миг, когда файловая система никем не занята, — этот. В командной строке ядра
+# стоит fsck.mode=skip именно потому, что проверять поздно, когда корень уже
+# смонтирован.
+#
+# Поводом стала настоящая порча 2026-09-22: паники, которыми я ловил сбой
+# выравнивания в звуке, оставили битый inode (ядро ругалось
+# "iget: checksum invalid") и блоки, заявленные двумя inode сразу.
+#
+# Порядок обычный для загрузчиков: сперва -p (чинит только безобидное и молча),
+# а если он сдался (код 4 и выше — «нужна рука»), то -fy. Второй способен
+# утащить оторванные файлы в lost+found, но выбор тут между этим и медленно
+# расползающимся повреждением.
+if [ -x /sbin/e2fsck ]; then
+    log "e2fsck -p /dev/mmcblk0p48"
+    /sbin/e2fsck -p /dev/mmcblk0p48 > /dev/kmsg 2>&1
+    otvet=$?
+    log "e2fsck -p exit $otvet"
+    if [ "$otvet" -ge 4 ]; then
+        log "filesystem needs full repair, running e2fsck -fy"
+        /sbin/e2fsck -fy /dev/mmcblk0p48 > /dev/kmsg 2>&1
+        log "e2fsck -fy exit $?"
+    fi
+else
+    log "no e2fsck in initramfs, skipping check"
+fi
+
+# Deliberately NO bf7-mark-boot-success here (see header).
+# Корень монтируется «ro» С журналом. Раньше было «ro,noload» — осторожность
+# первых дней, пока путь к eMMC нового ядра не был проверен. Но noload
+# переживает перемонтирование systemd на запись: система годами (ну, днями)
+# писала на корень БЕЗ журнала ext4, и любое нечистое выключение оставляло
+# рассогласованную ФС — 2026-09-23 e2fsck -p ответил 4, чинил -fy, а до того
+# одна загрузка встала с «access denied» на консоли. Журнал к этому месту уже
+# проигран e2fsck, так что «ro» ничего не пишет.
+MOUNT_OPTS=ro
+has_opt bf7.rootrw=1 && MOUNT_OPTS=rw
+log "mounting /dev/mmcblk0p48 with $MOUNT_OPTS"
+if ! mount -t ext4 -o "$MOUNT_OPTS" /dev/mmcblk0p48 /newroot; then
+    log "Debian root mount failed; RNDIS/ACM recovery remains available"
+    while :; do sleep 3600; done
+fi
+
+# Keep Debian's own systemd units from marking the slot: nothing here writes to
+# para.  The known-good B image keeps its mark-success behaviour untouched.
+
+# Mask the OEM-kernel-specific services that block the boot on the candidate
+# kernel.  systemd resolves unit files with /etc/systemd/system taking
+# precedence over /run/systemd/system, and these units live in /etc, so a
+# symlink farm in /run is silently shadowed.  Bind-mounting /dev/null over the
+# unit file itself is what systemd treats as "masked" (null_or_empty), works
+# regardless of precedence, and leaves no trace on eMMC: the mounts disappear
+# with this boot, so the known-good slot B keeps its Wi-Fi.
+# Wi-Fi-юниты больше не маскируем: они блокировали загрузку только потому,
+# что модули из /opt/bf7/wifi собраны под заводское ядро и не грузились.
+# Теперь bf7-wifi-init выбирает каталог модулей по uname -r, а для
+# кандидата собран свой набор (kernel-work/scripts/build-bf7-connectivity.sh).
+# Проверено на живой системе: bf7-wifi поднимает wlan0, bf7-wpa
+# ассоциируется, bf7-static-wifi ставит 192.168.27.140 и шлюз отвечает.
+# bf7-dhcp оставляем замаскированным: статического адреса достаточно, а
+# ожидание аренды может задержать загрузку.  bf7-term и bf7-audio-route
+# не проверены.
+BF7_MASK="bf7-dhcp bf7-term bf7-audio-route"
+for u in $BF7_MASK; do
+    for d in /newroot/etc/systemd/system /newroot/lib/systemd/system; do
+        [ -f "$d/$u.service" ] && mount --bind /dev/null "$d/$u.service" \
+            && log "masked $d/$u.service"
+    done
+done
+
+mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run
+mount --move /proc /newroot/proc
+mount --move /sys /newroot/sys
+mount --move /dev /newroot/dev
+log "switch_root -> /sbin/init ($MOUNT_OPTS)"
+exec switch_root /newroot /sbin/init

@@ -1,0 +1,16 @@
+# BF7: чем открывать файлы по умолчанию (кладётся в /etc/xdg/mimeapps.list).
+# Своего списка не было нигде, и GLib брал первого попавшегося: снимки с
+# камеры открывал ImageMagick «display» — окно X11 с меню для мыши.
+[Default Applications]
+image/jpeg=org.gnome.eog.desktop
+image/png=org.gnome.eog.desktop
+image/gif=org.gnome.eog.desktop
+image/webp=org.gnome.eog.desktop
+image/bmp=org.gnome.eog.desktop
+image/tiff=org.gnome.eog.desktop
+image/svg+xml=org.gnome.eog.desktop
+application/pdf=org.gnome.Evince.desktop
+text/html=bf7-web.desktop
+application/xhtml+xml=bf7-web.desktop
+x-scheme-handler/http=bf7-web.desktop
+x-scheme-handler/https=bf7-web.desktop

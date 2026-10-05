@@ -1,0 +1,265 @@
+From ab9e356a4e0c52db85cfc6b30f8b381327c8b14b Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Fri, 25 Sep 2026 14:19:48 +0300
+Subject: [PATCH 33/40] =?UTF-8?q?BF7:=20=D0=BF=D0=BE=D1=82=D0=BE=D0=BA?=
+ =?UTF-8?q?=D0=B8=20=D1=8F=D0=B4=D1=80=D0=B0=20MediaTek=20=D0=B6=D0=B4?=
+ =?UTF-8?q?=D1=83=D1=82=20=D0=B2=20TASK=5FIDLE=20=E2=80=94=20load=20averag?=
+ =?UTF-8?q?e=2014=20=D0=B2=20=D0=BF=D0=BE=D0=BA=D0=BE=D0=B5=20=D1=83=D1=85?=
+ =?UTF-8?q?=D0=BE=D0=B4=D0=B8=D1=82?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+hang_detect, ccci_poll, rpmb_open (request_send), battery/power_misc,
+gauge_coulomb, charger: msleep → schedule_timeout_idle,
+wait_event → wait_event_idle. disp_idlemgr/disp_check: общий макрос
+ожидания состояния → wait_event_idle_timeout. decouple_trigger:
+wait_event_idle. tee_irq_bh: killable → interruptible (сигналов у потока
+нет). sspm_ipi_recv_wait: interruptible только для потоков ядра.
+ddp_irq_log_kthread больше не создаётся — MediaTek его не запускал.
+Ни один из потоков не замораживаемый, ложных сигналов нет.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/misc/mediatek/eccci/fsm/ccci_fsm_poller.c   |  3 ++-
+ drivers/misc/mediatek/monitor_hang/monitor_hang.c   |  9 +++++++--
+ drivers/misc/mediatek/sspm/sspm_ipi_mbox.c          | 10 +++++++++-
+ .../misc/mediatek/video/mt6765/dispsys/ddp_irq.c    | 13 +++++++------
+ .../mediatek/video/mt6765/videox/primary_display.c  |  5 +++--
+ drivers/power/supply/mtk_battery.c                  |  5 +++--
+ drivers/power/supply/mtk_battery_coulomb_service.c  |  3 ++-
+ drivers/power/supply/mtk_charger.c                  |  7 ++++---
+ drivers/tee/gud/500/MobiCoreDriver/admin.c          |  2 +-
+ drivers/tee/gud/500/MobiCoreDriver/nq.c             |  3 ++-
+ sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c     | 10 ++++++----
+ 11 files changed, 46 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_poller.c b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_poller.c
+index e82ecfbaf..0c200ea48 100644
+--- a/drivers/misc/mediatek/eccci/fsm/ccci_fsm_poller.c
++++ b/drivers/misc/mediatek/eccci/fsm/ccci_fsm_poller.c
+@@ -136,7 +136,8 @@ static int fsm_poll_main(void *data)
+ 			}
+ 		}
+ next:
+-		msleep(POLLING_INTERVAL_TIME);
++		/* BF7: TASK_IDLE — не в load average (см. monitor_hang.c) */
++		schedule_timeout_idle(msecs_to_jiffies(POLLING_INTERVAL_TIME));
+ 	}
+ 	return 0;
+ }
+diff --git a/drivers/misc/mediatek/monitor_hang/monitor_hang.c b/drivers/misc/mediatek/monitor_hang/monitor_hang.c
+index c4230c7cf..19f22e591 100644
+--- a/drivers/misc/mediatek/monitor_hang/monitor_hang.c
++++ b/drivers/misc/mediatek/monitor_hang/monitor_hang.c
+@@ -1940,7 +1940,12 @@ static int hang_detect_thread(void *arg)
+ 
+ 	sched_setscheduler(current, SCHED_FIFO, &param);
+ 	reset_hang_info();
+-	msleep(120 * 1000);
++	/*
++	 * BF7: спать TASK_IDLE, а не msleep (TASK_UNINTERRUPTIBLE). Поведение то
++	 * же, но поток не попадает в load average: 13 таких потоков MediaTek
++	 * держали его на 14 в полном покое.
++	 */
++	schedule_timeout_idle(msecs_to_jiffies(120 * 1000));
+ 	pr_debug("[Hang_Detect] hang_detect thread starts.\n");
+ 
+ #ifdef BOOT_UP_HANG
+@@ -2000,7 +2005,7 @@ static int hang_detect_thread(void *arg)
+ 			hang_detect_counter--;
+ 		}
+ 
+-		msleep((HD_INTER) * 1000);
++		schedule_timeout_idle(msecs_to_jiffies((HD_INTER) * 1000));
+ 	}
+ 	return 0;
+ }
+diff --git a/drivers/misc/mediatek/sspm/sspm_ipi_mbox.c b/drivers/misc/mediatek/sspm/sspm_ipi_mbox.c
+index d9a6986e6..111c88c82 100644
+--- a/drivers/misc/mediatek/sspm/sspm_ipi_mbox.c
++++ b/drivers/misc/mediatek/sspm/sspm_ipi_mbox.c
+@@ -365,7 +365,15 @@ int sspm_ipi_recv_wait(int mid)
+ 		return IPI_SERVICE_NOT_AVAILABLE;
+ 
+ 	pin = &(recv_pintable[mid]);
+-	wait_for_completion(&sema_ipi_task[mid]);
++	/*
++	 * BF7: поток ядра ждёт здесь вечно (ipi_cpu_dvfs_rt) и сидел в load
++	 * average. Сигналов у потоков ядра нет, поэтому для них interruptible —
++	 * то же ожидание; обычным процессам оставлено прежнее.
++	 */
++	if (current->flags & PF_KTHREAD)
++		wait_for_completion_interruptible(&sema_ipi_task[mid]);
++	else
++		wait_for_completion(&sema_ipi_task[mid]);
+ 
+ 	/* if the pin is waiting async data, eliminate multiple completions */
+ 	if (pin->act->lock)
+diff --git a/drivers/misc/mediatek/video/mt6765/dispsys/ddp_irq.c b/drivers/misc/mediatek/video/mt6765/dispsys/ddp_irq.c
+index 62ff88c25..aa94d8578 100644
+--- a/drivers/misc/mediatek/video/mt6765/dispsys/ddp_irq.c
++++ b/drivers/misc/mediatek/video/mt6765/dispsys/ddp_irq.c
+@@ -546,11 +546,12 @@ int disp_init_irq(void)
+ 
+ 	/* create irq log thread */
+ 	init_waitqueue_head(&disp_irq_log_wq);
+-	disp_irq_log_task = kthread_create(disp_irq_log_kthread_func,
+-		NULL, "ddp_irq_log_kthread");
+-	if (IS_ERR(disp_irq_log_task))
+-		DDPERR(" can not create disp_irq_log_task kthread\n");
+-
+-	/* wake_up_process(disp_irq_log_task); */
++	/*
++	 * BF7: поток не создаём. MediaTek его не запускает (wake_up_process
++	 * закомментирован), и он висел в TASK_UNINTERRUPTIBLE со старта,
++	 * добавляя единицу к load average.
++	 */
++	(void)disp_irq_log_task;
++	(void)disp_irq_log_kthread_func;
+ 	return 0;
+ }
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+index da716c242..63a436995 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
++++ b/drivers/misc/mediatek/video/mt6765/videox/primary_display.c
+@@ -555,8 +555,9 @@ void debug_print_power_mode_check(enum mtkfb_power_mode prev,
+ /* use MAX_SCHEDULE_TIMEOUT to wait for ever
+  * NOTES: primary_path_lock should NOT be held when call this func !!!!!!!!
+  */
++/* BF7: _idle — то же ожидание, но не в load average (disp_idlemgr, disp_check) */
+ #define __primary_display_wait_state(condition, timeout) \
+-	wait_event_timeout(display_state_wait_queue, condition, timeout)
++	wait_event_idle_timeout(display_state_wait_queue, condition, timeout)
+ 
+ long primary_display_wait_state(enum DISP_POWER_STATE state, long timeout)
+ {
+@@ -5530,7 +5531,7 @@ static int decouple_trigger_worker_thread(void *data)
+ 	sched_setscheduler(current, SCHED_RR, &param);
+ 
+ 	while (1) {
+-		wait_event(decouple_trigger_wq,
++		wait_event_idle(decouple_trigger_wq,	/* BF7: не в load average */
+ 			atomic_read(&decouple_trigger_event));
+ 		dpmgr_wait_event(pgc->dpmgr_handle, DISP_PATH_EVENT_IF_VSYNC);
+ 
+diff --git a/drivers/power/supply/mtk_battery.c b/drivers/power/supply/mtk_battery.c
+index 8dfd87846..2653d2e57 100644
+--- a/drivers/power/supply/mtk_battery.c
++++ b/drivers/power/supply/mtk_battery.c
+@@ -2391,7 +2391,8 @@ int battery_update_routine(void *arg)
+ 	battery_update_psd(gm);
+ 	while (1) {
+ 		bm_err("%s\n", __func__);
+-		wait_event(gm->wait_que, (gm->fg_update_flag > 0));
++		/* BF7: TASK_IDLE — не в load average */
++		wait_event_idle(gm->wait_que, (gm->fg_update_flag > 0));
+ 		gm->fg_update_flag = 0;
+ 
+ 		fg_drv_update_hw_status(gm);
+@@ -2940,7 +2941,7 @@ static int power_misc_routine_thread(void *arg)
+ 	struct shutdown_controller *sdd = &gm->sdc;
+ 
+ 	while (1) {
+-		wait_event(sdd->wait_que, (sdd->timeout == true)
++		wait_event_idle(sdd->wait_que, (sdd->timeout == true)
+ 			|| (sdd->overheat == true));
+ 		if (sdd->timeout == true) {
+ 			sdd->timeout = false;
+diff --git a/drivers/power/supply/mtk_battery_coulomb_service.c b/drivers/power/supply/mtk_battery_coulomb_service.c
+index 47002c9fd..d4b961e00 100644
+--- a/drivers/power/supply/mtk_battery_coulomb_service.c
++++ b/drivers/power/supply/mtk_battery_coulomb_service.c
+@@ -418,7 +418,8 @@ static int gauge_coulomb_thread(void *arg)
+ 		fix_coverity = 1;
+ 
+ 	while (1) {
+-		wait_event(cs->wait_que, (cs->coulomb_thread_timeout == true));
++		/* BF7: TASK_IDLE — не в load average */
++		wait_event_idle(cs->wait_que, (cs->coulomb_thread_timeout == true));
+ 		cs->coulomb_thread_timeout = false;
+ 		get_monotonic_boottime(&start);
+ 
+diff --git a/drivers/power/supply/mtk_charger.c b/drivers/power/supply/mtk_charger.c
+index 4b802ffdb..851862092 100644
+--- a/drivers/power/supply/mtk_charger.c
++++ b/drivers/power/supply/mtk_charger.c
+@@ -1588,7 +1588,8 @@ static int charger_routine_thread(void *arg)
+ 	bool is_charger_on;
+ 
+ 	while (1) {
+-		wait_event(info->wait_que,
++		/* BF7: TASK_IDLE — не в load average */
++		wait_event_idle(info->wait_que,
+ 			(info->charger_thread_timeout == true));
+ 
+ 		/*
+@@ -1612,7 +1613,7 @@ static int charger_routine_thread(void *arg)
+ 			if (bf7_popytok <= BF7_POPYTOK_GROMKO) {
+ 				chr_err("charger_init fail (попытка %u)\n",
+ 					bf7_popytok);
+-				msleep(5000);
++				schedule_timeout_idle(msecs_to_jiffies(5000));
+ 			} else {
+ 				/*
+ 				 * BF7: удаться не может никогда — на плате нет
+@@ -1623,7 +1624,7 @@ static int charger_routine_thread(void *arg)
+ 				 */
+ 				if (bf7_popytok == BF7_POPYTOK_GROMKO + 1)
+ 					chr_err("charger_init не удаётся, дальше пробую раз в полчаса\n");
+-				msleep(30 * 60000);
++				schedule_timeout_idle(msecs_to_jiffies(30 * 60000));
+ 			}
+ 		}
+ 
+diff --git a/drivers/tee/gud/500/MobiCoreDriver/admin.c b/drivers/tee/gud/500/MobiCoreDriver/admin.c
+index b0587a924..379513052 100644
+--- a/drivers/tee/gud/500/MobiCoreDriver/admin.c
++++ b/drivers/tee/gud/500/MobiCoreDriver/admin.c
+@@ -252,7 +252,7 @@ static int request_send(u32 command, const struct mc_uuid_t *uuid, bool is_gp)
+ 		 * "500"), а не соседний drivers/misc/mediatek/gud/410 — я сперва
+ 		 * поправил тот, и замер не сдвинулся.
+ 		 */
+-		msleep(1000);
++		schedule_timeout_idle(msecs_to_jiffies(1000));	/* не в load average */
+ 		counter_ms += 1000;
+ 		mutex_lock(&g_request.states_mutex);
+ 	}
+diff --git a/drivers/tee/gud/500/MobiCoreDriver/nq.c b/drivers/tee/gud/500/MobiCoreDriver/nq.c
+index 8fc3a1296..9c3732120 100644
+--- a/drivers/tee/gud/500/MobiCoreDriver/nq.c
++++ b/drivers/tee/gud/500/MobiCoreDriver/nq.c
+@@ -245,7 +245,8 @@ static int irq_bh_worker(void *arg)
+ 	struct notification_queue *rx = l_ctx.nq.rx;
+ 
+ 	while (1) {
+-		wait_for_completion_killable(&l_ctx.irq_bh_complete);
++		/* BF7: у потока ядра сигналов нет — то же, но не в load average */
++		wait_for_completion_interruptible(&l_ctx.irq_bh_complete);
+ 
+ 		/* This thread can only be stopped with nq_stop */
+ 		if (!l_ctx.irq_bh_thread_run)
+diff --git a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+index c14bf2532..1bb8197fc 100644
+--- a/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
++++ b/sound/soc/mediatek/common_int/mtk-soc-pcm-dl1.c
+@@ -163,10 +163,12 @@ static snd_pcm_uframes_t mtk_pcm_pointer(struct snd_pcm_substream *substream)
+  * SRAM отображена как память устройства: каждая 8-байтовая запись memcpy_toio
+  * идёт отдельной транзакцией, ~6 МБ/с. Замер perf 2026-09-25: треть времени
+  * PulseAudio при воспроизведении — в __memcpy_toio, ~3% ядра непрерывно.
+- * DRAM из dma_alloc_coherent — Normal-NC, записи склеиваются. SRAM нужна
+- * MediaTek, чтобы DRAM спала во время музыки при погашенном экране; у нас
+- * звук во сне не играет. Выключить на лету (со следующего открытия
+- * устройства): echo 0 > /sys/module/mtk_soc_pcm_dl1/parameters/bf7_dl1_dram
++ * DRAM из dma_alloc_coherent — Normal-NC, записи склеиваются. Цена: ветка
++ * DRAM держит spm_resource_req(AUDIO, DRAM), и пока играет звук, память не
++ * уходит в самообновление (ради этого MediaTek и держит DL1 в SRAM). Что
++ * выгоднее при погашенном экране — решает замер тока; переключается на лету
++ * со следующего открытия устройства:
++ *   echo 0 > /sys/module/mtk_soc_pcm_dl1/parameters/bf7_dl1_dram
+  */
+ static bool bf7_dl1_dram = true;
+ module_param(bf7_dl1_dram, bool, 0644);
+-- 
+2.55.0
+

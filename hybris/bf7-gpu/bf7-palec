@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""BF7: палец — касания и жесты по экрану без рук.
+
+Пишет события прямо в узел тача (/dev/input/event2, «mtk-tpd2»): ядро
+принимает запись в evdev как ввод от самого устройства, и phoc получает
+касание так же, как от настоящего пальца. Отдельный uinput не нужен.
+
+    bf7-palec tap X Y                   — нажать
+    bf7-palec swipe X1 Y1 X2 Y2 [мс]    — провести (по умолчанию 300 мс)
+    bf7-palec hold X Y [мс]             — долгое нажатие (по умолчанию 800 мс)
+
+Координаты — пиксели панели 720x1612, от левого верхнего угла, как на экране.
+Тач у BF7 стоит развёрнутым на 180°, и libinput поворачивает его матрицей
+LIBINPUT_CALIBRATION_MATRIX из udev (99-bf7-touch.rules). Писать в узел надо
+сырые координаты, поэтому экранные пропускаются через обратную матрицу —
+иначе свайп «вверх от низа» становится «вниз от верхнего края» (шторка).
+Проверять результат камерой (tools/bf7-glaz.sh): буфер кадра может врать.
+"""
+import os
+import struct
+import subprocess
+import sys
+import time
+
+UZEL = "/dev/input/event2"
+SHIRINA, VYSOTA = 720, 1612
+
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+SYN_REPORT = 0
+BTN_TOOL_FINGER, BTN_TOUCH = 325, 330
+ABS_X, ABS_Y = 0, 1
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2f, 0x35, 0x36, 0x39
+
+SHAG_MS = 10
+
+
+def obratnaya_matrica():
+    """Экранные доли 0..1 → сырые доли по обратной матрице калибровки libinput."""
+    a, b, c, d, e, f = 1.0, 0.0, 0.0, 0.0, 1.0, 0.0
+    try:
+        out = subprocess.run(["udevadm", "info", "-q", "property", "-n", UZEL],
+                             capture_output=True, text=True).stdout
+        for s in out.splitlines():
+            if s.startswith("LIBINPUT_CALIBRATION_MATRIX="):
+                a, b, c, d, e, f = map(float, s.split("=", 1)[1].split())
+    except (OSError, ValueError):
+        pass
+    det = a * e - b * d
+    if not det:
+        return lambda u, v: (u, v)
+    # экран = M·сырое + сдвиг  →  сырое = M⁻¹·(экран − сдвиг)
+    return lambda u, v: ((e * (u - c) - b * (v - f)) / det,
+                         (-d * (u - c) + a * (v - f)) / det)
+
+
+class Palec:
+    def __init__(self):
+        self.fd = os.open(UZEL, os.O_WRONLY)
+        self.nomer = int(time.time()) & 0x7fff
+        self.syroe = obratnaya_matrica()
+
+    def v_syrye(self, x, y):
+        u, v = self.syroe((x + 0.5) / SHIRINA, (y + 0.5) / VYSOTA)
+        return (min(SHIRINA - 1, max(0, int(u * SHIRINA))),
+                min(VYSOTA - 1, max(0, int(v * VYSOTA))))
+
+    def pisat(self, *sobytiya):
+        t = time.time()
+        sek, mks = int(t), int((t % 1) * 1e6)
+        paket = b"".join(struct.pack("qqHHi", sek, mks, tip, kod, zn)
+                         for tip, kod, zn in sobytiya)
+        os.write(self.fd, paket + struct.pack("qqHHi", sek, mks, EV_SYN, SYN_REPORT, 0))
+
+    def vniz(self, x, y):
+        x, y = self.v_syrye(x, y)
+        self.pisat((EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, self.nomer),
+                   (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y),
+                   (EV_KEY, BTN_TOUCH, 1), (EV_KEY, BTN_TOOL_FINGER, 1),
+                   (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y))
+
+    def vesti(self, x, y):
+        x, y = self.v_syrye(x, y)
+        self.pisat((EV_ABS, ABS_MT_SLOT, 0),
+                   (EV_ABS, ABS_MT_POSITION_X, x), (EV_ABS, ABS_MT_POSITION_Y, y),
+                   (EV_ABS, ABS_X, x), (EV_ABS, ABS_Y, y))
+
+    def vverh(self):
+        self.pisat((EV_ABS, ABS_MT_SLOT, 0), (EV_ABS, ABS_MT_TRACKING_ID, -1),
+                   (EV_KEY, BTN_TOUCH, 0), (EV_KEY, BTN_TOOL_FINGER, 0))
+
+    def tap(self, x, y):
+        self.vniz(x, y)
+        time.sleep(0.06)
+        self.vverh()
+
+    def hold(self, x, y, ms=800):
+        self.vniz(x, y)
+        time.sleep(ms / 1000)
+        self.vverh()
+
+    def swipe(self, x1, y1, x2, y2, ms=300):
+        shagov = max(2, ms // SHAG_MS)
+        self.vniz(x1, y1)
+        for i in range(1, shagov + 1):
+            time.sleep(SHAG_MS / 1000)
+            self.vesti(x1 + (x2 - x1) * i // shagov, y1 + (y2 - y1) * i // shagov)
+        time.sleep(0.02)
+        self.vverh()
+
+
+def tochka(s, predel):
+    v = int(s)
+    if not 0 <= v < predel:
+        raise ValueError("координата %d вне 0..%d" % (v, predel - 1))
+    return v
+
+
+def main(a):
+    if len(a) < 3:
+        print(__doc__.strip().split("\n\n")[2], file=sys.stderr)
+        return 2
+    p = Palec()
+    kom = a[0]
+    if kom == "tap" and len(a) == 3:
+        p.tap(tochka(a[1], SHIRINA), tochka(a[2], VYSOTA))
+    elif kom == "hold" and len(a) in (3, 4):
+        p.hold(tochka(a[1], SHIRINA), tochka(a[2], VYSOTA), int(a[3]) if len(a) == 4 else 800)
+    elif kom == "swipe" and len(a) in (5, 6):
+        p.swipe(tochka(a[1], SHIRINA), tochka(a[2], VYSOTA),
+                tochka(a[3], SHIRINA), tochka(a[4], VYSOTA),
+                int(a[5]) if len(a) == 6 else 300)
+    else:
+        print("не понял: %s" % " ".join(a), file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

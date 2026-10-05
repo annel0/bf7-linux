@@ -1,0 +1,31 @@
+Index: modemmanager-1.20.4/src/mm-broadband-modem.c
+===================================================================
+--- a/src/mm-broadband-modem.c	2026-09-24 08:29:42.147906952 +0300
++++ b/src/mm-broadband-modem.c	2026-09-24 10:48:01.481267657 +0300
+@@ -5046,6 +5046,8 @@
+     g_object_unref (task);
+ }
+ 
++static gboolean bf7_is_mtk_voice (MMBroadbandModem *self);
++
+ static void
+ modem_3gpp_register_in_network (MMIfaceModem3gpp    *self,
+                                 const gchar         *operator_id,
+@@ -5058,6 +5060,17 @@
+ 
+     task = g_task_new (self, cancellable, callback, user_data);
+ 
++    /* BF7: the MTK modem is already in automatic mode (+COPS: 0,...), and
++     * AT+COPS=0 makes it redo network selection - it then picks GSM even when
++     * bf7-modem-sim has just brought it into LTE (and it never leaves GSM for
++     * LTE on its own on this network). So do not send it here. */
++    if (!operator_id && bf7_is_mtk_voice (MM_BROADBAND_MODEM (self))) {
++        mm_obj_dbg (self, "MTK: skipping +COPS=0, modem already selects the network automatically");
++        g_task_return_boolean (task, TRUE);
++        g_object_unref (task);
++        return;
++    }
++
+     /* Trigger automatic network registration if no explicit operator id given */
+     if (!operator_id) {
+         /* Note that '+COPS=0,,' (same but with commas) won't work in some Nokia

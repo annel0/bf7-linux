@@ -1,0 +1,29 @@
+#!/bin/bash
+# Снять серию сырых кадров одним заходом.
+# Складывать их будем не тут, а на большой машине: тогда одно и то же
+# содержимое сцены можно перебрать по 2, 4, 6, 8, 16 кадров и сравнить честно.
+#
+#   bf7-burst [сколько кадров] [каталог]
+set -u
+N=${1:-16}
+D=${2:-/root/серии/$(date +%Y%m%d-%H%M%S)}
+V=/sys/class/leds/vibrator/brightness
+buzz() { [ -w $V ] && { echo 200 > $V; sleep "$1"; echo 0 > $V; }; }
+
+mkdir -p "$D"
+rm -f /run/bf7-camd.grabbed
+buzz 0.25
+echo "серия $D $N" > /run/bf7-camd
+for i in $(seq 1 100); do
+    [ -e /run/bf7-camd.grabbed ] && break
+    sleep 0.1
+done
+buzz 0.06                       # кадры сняты, можно двигаться
+for i in $(seq 1 300); do
+    [ -s "$D/опись.txt" ] && { buzz 0.06; sleep 0.12; buzz 0.06
+        echo "$D"; ls -la "$D" | tail -n +2 | head -3; exit 0; }
+    sleep 0.25
+done
+buzz 0.8
+echo "не вышло: $D" >&2
+exit 1

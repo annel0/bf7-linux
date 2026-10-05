@@ -1,0 +1,13 @@
+[Unit]
+Description=BF7 fixed Wi-Fi LAN address
+After=bf7-wpa.service
+Requires=bf7-wpa.service
+Before=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/bf7-static-wifi
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

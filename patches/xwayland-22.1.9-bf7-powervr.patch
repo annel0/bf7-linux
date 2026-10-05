@@ -1,0 +1,198 @@
+--- a/glamor/glamor.c
++++ b/glamor/glamor.c
+@@ -581,7 +581,33 @@
+     glamor_add_format(screen, 16, PICT_r5g6b5,
+                       GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, TRUE);
+ 
+-    if (glamor_priv->is_gles) {
++    if (glamor_priv->is_gles &&
++        epoxy_has_gl_extension("GL_EXT_texture_format_BGRA8888") &&
++        !getenv("GLAMOR_NO_BGRA")) {
++        /*
++         * BF7: на GLES экран объявляется как a8b8g8r8 (красный в младшем
++         * байте) — так требует GLES2, где гарантирован только GL_RGBA.
++         *
++         * Беда в том, что буфер композитору Xwayland отдаёт с форматом,
++         * выведенным из ГЛУБИНЫ окна (wl_drm_format_for_depth), а там
++         * ARGB8888, то есть синий в младшем байте. Обе стороны по-своему
++         * правы, а вместе не сходятся: красное показывается синим.
++         *
++         * Отсюда же поток GL_INVALID_OPERATION на glTexSubImage2D: загрузка
++         * идёт с GL_RGBA, а образ EGL создан как ARGB8888, и строгий драйвер
++         * такое сочетание не принимает.
++         *
++         * Если драйвер умеет BGRA (GL_EXT_texture_format_BGRA8888), обе беды
++         * снимаются разом: объявляем ровно тот порядок, которого ждёт
++         * остальной конвейер. Чтение назад требует GL_EXT_read_format_bgra —
++         * у PowerVR оно есть.
++         */
++        assert(X_BYTE_ORDER == X_LITTLE_ENDIAN);
++        glamor_add_format(screen, 24, PICT_x8r8g8b8,
++                          GL_BGRA_EXT, GL_BGRA_EXT, GL_UNSIGNED_BYTE, TRUE);
++        glamor_add_format(screen, 32, PICT_a8r8g8b8,
++                          GL_BGRA_EXT, GL_BGRA_EXT, GL_UNSIGNED_BYTE, TRUE);
++    } else if (glamor_priv->is_gles) {
+         assert(X_BYTE_ORDER == X_LITTLE_ENDIAN);
+         glamor_add_format(screen, 24, PICT_x8b8g8r8,
+                           GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, TRUE);
+--- a/glamor/glamor_transfer.c
++++ b/glamor/glamor_transfer.c
+@@ -20,6 +20,8 @@
+  * OF THIS SOFTWARE.
+  */
+ 
++#include <stdlib.h>
++
+ #include "glamor_priv.h"
+ #include "glamor_transfer.h"
+ 
+@@ -77,6 +79,48 @@
+                                 x2 - x1, y2 - y1,
+                                 f->format, f->type,
+                                 bits + ofs);
++                /*
++                 * BF7: какой формат отвергает драйвер.
++                 * Печатаем один раз на сочетание, иначе журнал утонет.
++                 */
++                if (getenv("GLAMOR_UPLOAD_DIAG")) {
++                    GLenum e = glGetError();
++
++                    if (e != GL_NO_ERROR) {
++                        static unsigned seen[16];
++                        static int nseen;
++                        unsigned key = (f->format << 16) ^ f->type ^
++                                       (pixmap->drawable.depth << 8);
++                        int i, known = 0;
++
++                        for (i = 0; i < nseen; i++)
++                            if (seen[i] == key) { known = 1; break; }
++                        if (!known && nseen < 16) {
++                            seen[nseen++] = key;
++                            GLint pbo = 0, texw = 0, texh = 0, curtex = 0;
++
++                            glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &pbo);
++                            glGetIntegerv(GL_TEXTURE_BINDING_2D, &curtex);
++                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0,
++                                                     GL_TEXTURE_WIDTH, &texw);
++                            glGetTexLevelParameteriv(GL_TEXTURE_2D, 0,
++                                                     GL_TEXTURE_HEIGHT, &texh);
++                            ErrorF("BF7 upload: карта %dx%d глубина %d bpp %d; "
++                                   "текстура %d размером %dx%d; кусок %d,%d %dx%d; "
++                                   "format 0x%x type 0x%x шаг %u; "
++                                   "буфер распаковки %d; ошибка 0x%x\n",
++                                   pixmap->drawable.width,
++                                   pixmap->drawable.height,
++                                   pixmap->drawable.depth,
++                                   pixmap->drawable.bitsPerPixel,
++                                   curtex, texw, texh,
++                                   x1 - box->x1, y1 - box->y1,
++                                   x2 - x1, y2 - y1,
++                                   f->format, f->type, byte_stride,
++                                   pbo, e);
++                        }
++                    }
++                }
+             } else {
+                 for (; y1 < y2; y1++, ofs += byte_stride)
+                     glTexSubImage2D(GL_TEXTURE_2D, 0,
+--- a/glamor/glamor_spans.c
++++ b/glamor/glamor_spans.c
+@@ -20,6 +20,8 @@
+  * OF THIS SOFTWARE.
+  */
+ 
++#include <stdlib.h>
++
+ #include "glamor_priv.h"
+ #include "glamor_transform.h"
+ #include "glamor_transfer.h"
+@@ -346,6 +348,22 @@
+                                 x1 - box->x1, y1 - box->y1, x2 - x1, 1,
+                                 f->format, f->type,
+                                 l);
++                if (getenv("GLAMOR_UPLOAD_DIAG")) {
++                    GLenum e = glGetError();
++
++                    if (e != GL_NO_ERROR) {
++                        static int said;
++
++                        if (!said) {
++                            said = 1;
++                            ErrorF("BF7 spans: глубина %d bpp %d, "
++                                   "format 0x%x type 0x%x, ошибка 0x%x\n",
++                                   drawable->depth,
++                                   drawable->bitsPerPixel,
++                                   f->format, f->type, e);
++                        }
++                    }
++                }
+             }
+             s += PixmapBytePad(w, drawable->depth);
+         }
+--- a/hw/xwayland/xwayland-window.c
++++ b/hw/xwayland/xwayland-window.c
+@@ -39,7 +39,16 @@
+ #include "xwayland-input.h"
+ #include "xwayland-present.h"
+ #include "xwayland-screen.h"
++#include <stdlib.h>
++
+ #include "xwayland-window.h"
++
++#ifdef XWL_HAS_GLAMOR
++/* BF7: объявление на месте — glamor.h не лежит на пути включений
++   этого каталога, а нужна ровно одна функция. */
++extern _X_EXPORT void glamor_finish(ScreenPtr screen);
++#endif
++
+ #include "xwayland-window-buffers.h"
+ #include "xwayland-shm.h"
+ 
+@@ -919,6 +928,23 @@
+     }
+ #endif
+ 
++#ifdef XWL_HAS_GLAMOR
++    /*
++     * BF7: дождаться GPU перед тем, как отдать буфер композитору.
++     *
++     * Через dma-buf кадр передаётся без fence'а, а неявной синхронизации у
++     * буферов gralloc нет: композитор успевает взять буфер раньше, чем GPU в
++     * него дорисовал. Наружу это выглядит как отставание ровно на кадр —
++     * рамка выделения не стирается после отпускания, а свежий кадр виден
++     * только когда придёт следующий. glamor_flush() тут не спасает: glFlush
++     * лишь отправляет работу, но не ждёт её.
++     *
++     * Отключается XWL_NO_FINISH, чтобы можно было сравнить.
++     */
++    if (xwl_screen->glamor && !getenv("XWL_NO_FINISH"))
++        glamor_finish(xwl_screen->screen);
++#endif
++
+     wl_surface_attach(xwl_window->surface, buffer, 0, 0);
+ 
+     /* Arbitrary limit to try to avoid flooding the Wayland
+--- a/hw/xwayland/xwayland-glamor-gbm.c
++++ b/hw/xwayland/xwayland-glamor-gbm.c
+@@ -265,6 +265,21 @@
+     if (xwl_pixmap->image == EGL_NO_IMAGE_KHR)
+       goto error;
+ 
++    /*
++     * BF7: снять чужую ошибку EGL перед проверкой своей.
++     *
++     * Проверка ниже смотрит eglGetError() после привязки образа. Но ошибка
++     * EGL общая на поток и держится до тех пор, пока её кто-нибудь не
++     * заберёт, а по дороге сюда её мог оставить совершенно посторонний
++     * вызов: Xwayland пробует запасной путь EGLStream и зовёт
++     * eglGetPlatformDisplayEXT с платформой устройства, которой у нашего EGL
++     * нет. Тот законно отвечает отказом, Xwayland это переживает и уходит на
++     * GBM — а ошибка остаётся висеть. Дальше она достаётся первому же буферу
++     * окна, то есть всему рабочему столу: панель показывает фон композитора,
++     * и наружу выходит одно лишь "Error getting buffer".
++     */
++    eglGetError();
++
+     glGenTextures(1, &xwl_pixmap->texture);
+     glBindTexture(GL_TEXTURE_2D, xwl_pixmap->texture);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);

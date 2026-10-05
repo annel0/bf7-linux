@@ -1,0 +1,15 @@
+[Unit]
+# BF7: кормилец детектора зависаний MediaTek — см. /usr/local/sbin/bf7-hang-kick.
+# Если система зависнет (не запускаются программы, не отвечает systemd),
+# кормёжка прекратится, и ядро перезагрузит телефон через ~5-6 минут.
+Description=BF7: кормилец детектора зависаний (самоперезагрузка при зависании)
+ConditionPathExists=/dev/RT_Monitor
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/bf7-hang-kick
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

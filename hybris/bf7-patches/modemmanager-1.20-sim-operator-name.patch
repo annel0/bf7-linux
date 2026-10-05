@@ -1,0 +1,44 @@
+Index: modemmanager-1.20.4/src/mm-iface-modem-3gpp.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-iface-modem-3gpp.c	2022-12-31 16:42:31.000000000 +0300
++++ modemmanager-1.20.4/src/mm-iface-modem-3gpp.c	2026-09-25 12:14:47.458359039 +0300
+@@ -22,6 +22,7 @@
+ #include <libmm-glib.h>
+ 
+ #include "mm-iface-modem.h"
++#include "mm-base-sim.h"
+ #include "mm-iface-modem-location.h"
+ #include "mm-iface-modem-3gpp.h"
+ #include "mm-base-modem.h"
+@@ -1781,6 +1782,31 @@
+         g_error_free (error);
+     }
+ 
++    /*
++     * BF7: some networks give no name at all, only the MCCMNC (e.g. some regional
++     * operators), and the modem reports the code as the name; phosh then shows
++     * "250xx" instead of the operator. If the "name" is just digits and
++     * equals the SIM's own operator code (i.e. we are at home), use the
++     * service provider name stored on the SIM.
++     */
++    if (str && str[0] && strspn (str, "0123456789") == strlen (str)) {
++        MMBaseSim *sim = NULL;
++
++        g_object_get (self, MM_IFACE_MODEM_SIM, &sim, NULL);
++        if (sim) {
++            const gchar *sim_code = mm_gdbus_sim_get_operator_identifier (MM_GDBUS_SIM (sim));
++            const gchar *spn = mm_gdbus_sim_get_operator_name (MM_GDBUS_SIM (sim));
++
++            if (spn && spn[0] && g_strcmp0 (sim_code, str) == 0) {
++                mm_obj_info (self, "network gave only operator code %s, using SIM operator name '%s'",
++                             str, spn);
++                g_free (str);
++                str = g_strdup (spn);
++            }
++            g_object_unref (sim);
++        }
++    }
++
+     if (ctx->skeleton)
+         mm_gdbus_modem3gpp_set_operator_name (ctx->skeleton, str);
+     g_free (str);

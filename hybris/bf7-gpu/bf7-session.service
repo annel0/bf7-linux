@@ -1,0 +1,20 @@
+[Unit]
+Description=Рабочий стол на панели телефона (Wayland-композитор + Xwayland + Xfce)
+After=bf7-android-mounts.service systemd-udevd.service dbus.service
+Requires=bf7-android-mounts.service
+ConditionPathExists=/root/gui/bf7gui
+
+[Service]
+Type=simple
+Environment=HOME=/root
+WorkingDirectory=/root
+ExecStart=/usr/local/bin/bf7-session
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

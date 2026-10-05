@@ -1,0 +1,35 @@
+Description: unblock signals in the embedded seatd server
+ The builtin backend forks and runs seatd in the child without exec, so the
+ child inherits the parent's signal mask. phoc blocks SIGUSR1; seatd then
+ never sees the VT release request and every VT switch hangs in
+ VT_WAITACTIVE. Reset the mask in the child.
+Author: bf7
+Forwarded: no
+Last-Update: 2026-09-23
+---
+--- a/libseat/backend/seatd.c	2026-09-23 12:41:59.776681162 +0300
++++ b/libseat/backend/seatd.c	2026-09-23 12:41:59.777713109 +0300
+@@ -2,6 +2,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <poll.h>
++#include <signal.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -616,6 +617,15 @@
+ 		return NULL;
+ 	} else if (pid == 0) {
+ 		close(fds[1]);
++		/*
++		 * The embedded server inherits the caller's signal mask. phoc
++		 * blocks SIGUSR1, and seatd needs SIGUSR1/SIGUSR2 for VT release
++		 * and acquire: with them blocked, any VT switch (chvt, console
++		 * suspend) waits forever in VT_WAITACTIVE. Start from a clean mask.
++		 */
++		sigset_t mask;
++		sigemptyset(&mask);
++		sigprocmask(SIG_SETMASK, &mask, NULL);
+ 		int fd = fds[0];
+ 		int res = 0;
+ 		struct server server = {0};

@@ -1,0 +1,16 @@
+[Unit]
+# BF7: пользовательская половина RPC модема. На старте модем спрашивает у
+# процессора приложений то, чего не знает ядро; без ccci_rpcd второе
+# рукопожатие срывается (MD_BOOT_HS2_FAIL). На Android — class core.
+Description=RPC модема MediaTek (ccci_rpcd)
+After=bf7-modem-mounts.service
+Requires=bf7-modem-mounts.service
+
+[Service]
+Environment=LD_PRELOAD=/vendor.local/lib64/libbf7prop.so:/vendor.local/lib64/libbf7log.so:/vendor.local/lib64/libselinux-stub.so:/vendor.local/lib64/libbf7wakelock.so
+ExecStart=/vendor/bin/ccci_rpcd 0
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

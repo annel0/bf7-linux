@@ -1,0 +1,563 @@
+diff --git a/drivers/misc/mediatek/cameraisp/src/mt6761/camera_isp.c b/drivers/misc/mediatek/cameraisp/src/mt6761/camera_isp.c
+index 5e23839b8..7c166e522 100644
+--- a/drivers/misc/mediatek/cameraisp/src/mt6761/camera_isp.c
++++ b/drivers/misc/mediatek/cameraisp/src/mt6761/camera_isp.c
+@@ -182,7 +182,23 @@ static u32 PMQoS_BW_value;
+ #define GPIO_BASE_ADDR 0x10002000
+ #define GPIO_RANGE (0x1000)
+ /* security     concern */
+-#define ISP_RANGE (0x10000)
++/*
++ * BF7: окно регистров, доступное из пользовательской части, расширено с
++ * 0x10000 до всего отображённого куска ispsys.
++ *
++ * Проверки в ISP_ReadReg()/ISP_WriteRegToHw() отмеряют смещение от
++ * gISPSYS_Reg[ISP_IMGSYS_CONFIG_BASE_ADDR] — а это отображение диапазона
++ * 0x15000000 длиной 0x52000 (третья запись reg у узла ispsys в дереве).
++ * Прежние 0x10000 отсекали ровно то, что нужно для съёмки кадра:
++ *   seninf — 0x15040000, то есть смещение 0x40000;
++ *   CAMSV  — 0x15050000, то есть смещение 0x50000.
++ * Отображение и так покрывает их целиком, ограничение было лишним.
++ *
++ * Настройку seninf и CAMSV у MediaTek делает пользовательская часть
++ * (seninf_drv.cpp в libcamdrv.so), поэтому без этого окна кадр из
++ * обычного Linux не снять никак.
++ */
++#define ISP_RANGE (0x52000)
+ /* ///////////////////////////////////////////////////////////////// */
+ 
+ /*******************************************************************
+diff --git a/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_hw.c b/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_hw.c
+index 2614d80b9..b669d4a07 100644
+--- a/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_hw.c
++++ b/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_hw.c
+@@ -179,6 +179,25 @@ enum IMGSENSOR_RETURN imgsensor_hw_power(
+ 	char str_index[LENGTH_FOR_SNPRINTF];
+ 	int ret = 0;
+ 
++	/*
++	 * BF7: имя драйвера сенсора может быть ещё не выбрано.
++	 *
++	 * Ниже стоит strstr(..., curr_sensor_name), а strstr с нулём уходит в
++	 * strlen(NULL) — обращение по нулевому адресу в ядре, паника и
++	 * перезагрузка телефона. Так и вышло 2026-09-17: программа позвала
++	 * SENSOR_FEATURE_CHECK_IS_ALIVE, не позвав перед этим
++	 * SENSOR_FEATURE_SET_DRIVER, и уронила систему одной командой ioctl.
++	 *
++	 * Андроидный HAL всегда зовёт их по порядку, поэтому у вендора это не
++	 * проявлялось. Но драйвер не имеет права падать от неверного порядка
++	 * вызовов из пользовательской части: отвечаем ошибкой.
++	 */
++	if (curr_sensor_name == NULL) {
++		pr_info("%s: имя сенсора не задано, питание не трогаем\n",
++			__func__);
++		return IMGSENSOR_RETURN_ERROR;
++	}
++
+ 	pr_info(
+ 		"sensor_idx %d, power %d curr_sensor_name %s, enable list %s\n",
+ 		sensor_idx,
+@@ -206,13 +225,34 @@ enum IMGSENSOR_RETURN imgsensor_hw_power(
+ 	    platform_power_sequence,
+ 	    str_index);
+ 
+-	imgsensor_hw_power_sequence(
++	/*
++	 * BF7: раньше возврат отсюда терялся, и это дорого нам обошлось.
++	 *
++	 * imgsensor_hw_power_sequence() отвечает ошибкой, когда имени сенсора
++	 * нет в sensor_power_sequence[]. Для hi556_mipi_raw такой записи в
++	 * дереве MediaTek не было вовсе — значит на переднее гнездо не
++	 * подавалось ничего, а наверх всё равно уходил SUCCESS. Снаружи это
++	 * выглядело как исправная подача питания и неисправный сенсор; на деле
++	 * молчал даже EEPROM гнезда.
++	 *
++	 * Проверяем только сенсорную последовательность. Платформенную
++	 * проверять нельзя: platform_power_sequence[] на этой плате целиком
++	 * под #ifdef MIPI_SWITCH и вырождается в {NULL}, то есть «ошибку» она
++	 * отдаёт всегда — проверка убила бы и главное гнездо.
++	 */
++	ret = imgsensor_hw_power_sequence(
+ 	    phw,
+ 	    sensor_idx,
+ 	    pwr_status,
+ 	    sensor_power_sequence,
+ 	    curr_sensor_name);
+ 
++	if (ret != IMGSENSOR_RETURN_SUCCESS) {
++		pr_info("%s: нет записи питания для %s (гнездо %d)\n",
++			__func__, curr_sensor_name, sensor_idx);
++		return IMGSENSOR_RETURN_ERROR;
++	}
++
+ 	return IMGSENSOR_RETURN_SUCCESS;
+ }
+ 
+diff --git a/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_proc.c b/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_proc.c
+index 7f799e3a6..73b0c4392 100644
+--- a/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_proc.c
++++ b/drivers/misc/mediatek/imgsensor/src/common/v1/imgsensor_proc.c
+@@ -455,6 +455,306 @@ static int imgsensor_proc_status_open(struct inode *inode, struct file *file)
+ 	return single_open(file, imgsensor_proc_status_read, NULL);
+ };
+ 
++/************************************************************************
++ * BF7: удержание питания на гнезде камеры
++ *
++ * Зачем. Штатный путь (SET_DRIVER -> CHECK_IS_ALIVE) подаёт питание,
++ * читает код сенсора и тут же снимает питание. Окно выходит около 25 мс —
++ * за него не успеть ни просканировать шину, ни посмотреть состояние ножек
++ * в debugfs. Этот переключатель подаёт то же самое питание и оставляет его,
++ * пока не скажут снять.
++ *
++ *     echo "0 on"  > /proc/driver/camsensor_power   # главное гнездо
++ *     echo "1 on"  > /proc/driver/camsensor_power   # переднее гнездо
++ *     cat          /proc/driver/camsensor_power     # что сейчас держим
++ *     echo "0 off" > /proc/driver/camsensor_power
++ *
++ * Отдельно — такты и ножки, чтобы перебирать догадки без пересборки ядра:
++ *
++ *     echo "0 mclk 1 1"        # включить мультиплексор camtg1_sel на 24 МГц
++ *     echo "0 mclk 1 1 26"     # то же, но 26 МГц
++ *     echo "0 pin PDN 1"       # поднять ножку PDN гнезда 0
++ *     echo "0 pin DVDD 1100"   # выставить цифровое питание 1,1 В
++ *
++ * Имена ножек: PDN RST AVDD DVDD DOVDD AFVDD MCLK. Значение — либо 0/1, либо
++ * напряжение в милливольтах из набора, который понимает драйвер
++ * (1000 1100 1200 1210 1220 1500 1800 2500 2800 2900).
++ *
++ * Про MCLK отдельно и важно. Какой мультиплексор кому достаётся, видно не из
++ * драйвера, а из дерева устройств: `cam0_mclk_on` переводит GPIO100 в режим 1,
++ * а это по таблице выводов MT6761 — **CMMCLK1**, то есть источник camtg1_sel.
++ * У переднего гнезда `cam1_mclk_on` — это GPIO99, режим 1, **CMMCLK0**, то
++ * есть camtg_sel. Нумерация гнёзд и нумерация CMMCLK здесь переставлены
++ * местами, и на этом легко обжечься.
++ *
++ * Имя сенсора выбирается само: берётся первая запись из
++ * sensor_power_sequence[], имя которой встречается в списке разрешённых для
++ * этого гнезда (cam<N>_enable_sensor из дерева устройств). Так работает и
++ * штатный перебор, только он ещё и требует ответа по шине.
++ *
++ * Про такты. Родительские такты camsys/seninf включает открытие
++ * /dev/kd_camera_hw, а его закрытие их гасит — и заодно
++ * imgsensor_hw_release_all() сбрасывает все ножки в «выключено». Чтобы
++ * чужое закрытие не погасило то, что мы держим, здесь повторён тот же учёт
++ * ссылок, что и у самого узла устройства: счётчик imgsensor_open_cnt.
++ *
++ * Важно при отладке: пока гнездо под удержанием, не гонять пробы, которые
++ * сами дёргают питание (CHECK_IS_ALIVE и прочее) — их выключение опустит
++ * сброс и погасит MCLK, а регуляторы останутся включёнными по счётчику, и
++ * измерять вы будете половинчатое состояние, не зная об этом.
++ ************************************************************************/
++static char *bf7_pwr_held[IMGSENSOR_SENSOR_IDX_MAX_NUM];
++
++/*
++ * Какой мультиплексор тактов обслуживает какое гнездо. Взято из дерева
++ * устройств: гнездо 0 сидит на CMMCLK1, гнездо 1 — на CMMCLK0 (см. шапку).
++ */
++static const unsigned int bf7_pwr_tg[] = { 1, 0, 2, 3 };
++
++static const struct {
++	const char *name;
++	enum IMGSENSOR_HW_PIN pin;
++} bf7_pin_names[] = {
++	{ "PDN",   IMGSENSOR_HW_PIN_PDN },
++	{ "RST",   IMGSENSOR_HW_PIN_RST },
++	{ "AVDD",  IMGSENSOR_HW_PIN_AVDD },
++	{ "DVDD",  IMGSENSOR_HW_PIN_DVDD },
++	{ "DOVDD", IMGSENSOR_HW_PIN_DOVDD },
++	{ "AFVDD", IMGSENSOR_HW_PIN_AFVDD },
++	{ "MCLK",  IMGSENSOR_HW_PIN_MCLK },
++};
++
++static const struct {
++	unsigned int mv;
++	enum IMGSENSOR_HW_PIN_STATE state;
++} bf7_pin_levels[] = {
++	{    0, IMGSENSOR_HW_PIN_STATE_LEVEL_0 },
++	{    1, IMGSENSOR_HW_PIN_STATE_LEVEL_HIGH },
++	{ 1000, IMGSENSOR_HW_PIN_STATE_LEVEL_1000 },
++	{ 1100, IMGSENSOR_HW_PIN_STATE_LEVEL_1100 },
++	{ 1200, IMGSENSOR_HW_PIN_STATE_LEVEL_1200 },
++	{ 1210, IMGSENSOR_HW_PIN_STATE_LEVEL_1210 },
++	{ 1220, IMGSENSOR_HW_PIN_STATE_LEVEL_1220 },
++	{ 1500, IMGSENSOR_HW_PIN_STATE_LEVEL_1500 },
++	{ 1800, IMGSENSOR_HW_PIN_STATE_LEVEL_1800 },
++	{ 2500, IMGSENSOR_HW_PIN_STATE_LEVEL_2500 },
++	{ 2800, IMGSENSOR_HW_PIN_STATE_LEVEL_2800 },
++	{ 2900, IMGSENSOR_HW_PIN_STATE_LEVEL_2900 },
++};
++
++static int bf7_pwr_mclk(unsigned int tg, int on, unsigned int freq)
++{
++	struct ACDK_SENSOR_MCLK_STRUCT mclk;
++
++	memset(&mclk, 0, sizeof(mclk));
++	mclk.TG   = (MUINT8)tg;
++	mclk.freq = freq;
++	mclk.on   = (MUINT8)(on ? 1 : 0);
++
++	return imgsensor_clk_set(&pgimgsensor->clk, &mclk);
++}
++
++static int bf7_pwr_pin(enum IMGSENSOR_SENSOR_IDX idx,
++		       enum IMGSENSOR_HW_PIN pin,
++		       enum IMGSENSOR_HW_PIN_STATE state)
++{
++	struct IMGSENSOR_HW_DEVICE *pdev =
++		pgimgsensor->hw.pdev[pgimgsensor->hw.sensor_pwr[idx].id[pin]];
++
++	if (pdev == NULL || pdev->set == NULL)
++		return -ENODEV;
++
++	pdev->set(pdev->pinstance, idx, pin, state);
++	return 0;
++}
++
++static char *bf7_pwr_pick_name(enum IMGSENSOR_SENSOR_IDX idx)
++{
++	struct IMGSENSOR_HW_POWER_SEQ *pseq = sensor_power_sequence;
++	const char *enable_list = pgimgsensor->hw.enable_sensor_by_index[idx];
++
++	if (enable_list == NULL)
++		return NULL;
++
++	while (pseq < sensor_power_sequence + IMGSENSOR_HW_SENSOR_MAX_NUM &&
++	       pseq->name != NULL) {
++		if (strstr(enable_list, pseq->name))
++			return pseq->name;
++		pseq++;
++	}
++
++	return NULL;
++}
++
++static int bf7_pwr_hold_read(struct seq_file *m, void *v)
++{
++	enum IMGSENSOR_SENSOR_IDX i;
++
++	for (i = IMGSENSOR_SENSOR_IDX_MIN_NUM;
++	     i < IMGSENSOR_SENSOR_IDX_MAX_NUM;
++	     i++) {
++		const char *list = pgimgsensor->hw.enable_sensor_by_index[i];
++		char *pick = bf7_pwr_pick_name(i);
++
++		seq_printf(m,
++			"гнездо %d: %s, разрешены [%s], запись питания есть у [%s]\n",
++			i,
++			bf7_pwr_held[i] ? "ПОД ПИТАНИЕМ" : "обесточено",
++			list ? list : "-",
++			pick ? pick : "-");
++	}
++
++	seq_printf(m, "открытий устройства: %d\n",
++		atomic_read(&pgimgsensor->imgsensor_open_cnt));
++
++	return 0;
++}
++
++static int bf7_pwr_hold_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, bf7_pwr_hold_read, NULL);
++}
++
++static ssize_t bf7_pwr_hold_write(
++	struct file *file,
++	const char __user *buffer,
++	size_t count,
++	loff_t *data)
++{
++	char buf[32] = { '\0' };
++	char verb[8] = { '\0' };
++	unsigned int idx = 0;
++	size_t len = (count < sizeof(buf) - 1) ? count : sizeof(buf) - 1;
++	struct IMGSENSOR_SENSOR *psensor;
++	char *name;
++	int ret;
++
++	if (copy_from_user(buf, buffer, len))
++		return -EFAULT;
++
++	if (sscanf(buf, "%u %7s", &idx, verb) != 2)
++		return -EINVAL;
++
++	if (idx >= IMGSENSOR_SENSOR_IDX_MAX_NUM)
++		return -EINVAL;
++
++	psensor = &pgimgsensor->sensor[idx];
++	/*
++	 * Номер гнезда обычно проставляет ioctl SET_DRIVER. Мы идём мимо него,
++	 * поэтому ставим сами: imgsensor_hw_power() читает его из psensor.
++	 */
++	psensor->inst.sensor_idx = idx;
++
++	if (!strncmp(verb, "on", 2)) {
++		if (bf7_pwr_held[idx] != NULL) {
++			pr_info("%s: гнездо %u уже держим (%s)\n",
++				__func__, idx, bf7_pwr_held[idx]);
++			return count;
++		}
++
++		name = bf7_pwr_pick_name(idx);
++		if (name == NULL) {
++			pr_info("%s: гнездо %u: нет записи питания ни для одного разрешённого сенсора\n",
++				__func__, idx);
++			return -ENODEV;
++		}
++
++		if (atomic_read(&pgimgsensor->imgsensor_open_cnt) == 0)
++			imgsensor_clk_enable_all(&pgimgsensor->clk);
++		atomic_inc(&pgimgsensor->imgsensor_open_cnt);
++
++		ret = imgsensor_hw_power(&pgimgsensor->hw, psensor, name,
++					 IMGSENSOR_HW_POWER_STATUS_ON);
++		if (ret != IMGSENSOR_RETURN_SUCCESS) {
++			atomic_dec(&pgimgsensor->imgsensor_open_cnt);
++			if (atomic_read(&pgimgsensor->imgsensor_open_cnt) == 0)
++				imgsensor_clk_disable_all(&pgimgsensor->clk);
++			pr_info("%s: гнездо %u (%s): питание подать не вышло\n",
++				__func__, idx, name);
++			return -EIO;
++		}
++
++		bf7_pwr_held[idx] = name;
++
++		/*
++		 * Такты включать здесь больше не надо: это делает mclk_set() в
++		 * самом пути питания (mt6761/camera_hw/mclk/mclk.c). Команда
++		 * `mclk` ниже осталась — ей удобно перебирать частоты и
++		 * мультиплексоры вручную.
++		 */
++		pr_info("%s: гнездо %u (%s): питание подано и удерживается\n",
++			__func__, idx, name);
++
++	} else if (!strncmp(verb, "mclk", 4)) {
++		unsigned int tg = 0, on = 0, freq = 24;
++		int n = sscanf(buf, "%*u %*7s %u %u %u", &tg, &on, &freq);
++
++		if (n < 2)
++			return -EINVAL;
++
++		ret = bf7_pwr_mclk(tg, on, freq);
++		pr_info("%s: мультиплексор тактов %u -> %s, %u МГц (ответ %d)\n",
++			__func__, tg, on ? "включён" : "выключен", freq, ret);
++
++	} else if (!strncmp(verb, "pin", 3)) {
++		char pname[8] = { '\0' };
++		unsigned int mv = 0;
++		unsigned int i;
++		enum IMGSENSOR_HW_PIN pin = IMGSENSOR_HW_PIN_NONE;
++		enum IMGSENSOR_HW_PIN_STATE state = IMGSENSOR_HW_PIN_STATE_NONE;
++
++		if (sscanf(buf, "%*u %*7s %7s %u", pname, &mv) != 2)
++			return -EINVAL;
++
++		for (i = 0; i < ARRAY_SIZE(bf7_pin_names); i++)
++			if (!strcmp(pname, bf7_pin_names[i].name))
++				pin = bf7_pin_names[i].pin;
++
++		for (i = 0; i < ARRAY_SIZE(bf7_pin_levels); i++)
++			if (mv == bf7_pin_levels[i].mv)
++				state = bf7_pin_levels[i].state;
++
++		if (pin == IMGSENSOR_HW_PIN_NONE ||
++		    state == IMGSENSOR_HW_PIN_STATE_NONE) {
++			pr_info("%s: не понял ножку «%s» или значение %u\n",
++				__func__, pname, mv);
++			return -EINVAL;
++		}
++
++		ret = bf7_pwr_pin(idx, pin, state);
++		pr_info("%s: гнездо %u, ножка %s -> %u (ответ %d)\n",
++			__func__, idx, pname, mv, ret);
++
++	} else if (!strncmp(verb, "off", 3)) {
++		if (bf7_pwr_held[idx] == NULL)
++			return count;
++
++		imgsensor_hw_power(&pgimgsensor->hw, psensor, bf7_pwr_held[idx],
++				   IMGSENSOR_HW_POWER_STATUS_OFF);
++		bf7_pwr_held[idx] = NULL;
++
++		atomic_dec(&pgimgsensor->imgsensor_open_cnt);
++		if (atomic_read(&pgimgsensor->imgsensor_open_cnt) == 0)
++			imgsensor_clk_disable_all(&pgimgsensor->clk);
++
++		pr_info("%s: гнездо %u: питание снято\n", __func__, idx);
++
++	} else {
++		return -EINVAL;
++	}
++
++	return count;
++}
++
++static const struct file_operations fcamera_proc_fops_bf7_power = {
++	.owner = THIS_MODULE,
++	.open  = bf7_pwr_hold_open,
++	.read  = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++	.write = bf7_pwr_hold_write,
++};
++
+ static const struct file_operations fcamera_proc_fops_status = {
+ 	.owner = THIS_MODULE,
+ 	.open = imgsensor_proc_status_open,
+@@ -517,6 +817,10 @@ enum IMGSENSOR_RETURN imgsensor_proc_init(void)
+ 	    "driver/pdaf_type", 0664, NULL, &fcamera_proc_fops_set_pdaf_type);
+ 	proc_create(PROC_SENSOR_STAT, 0664, NULL, &fcamera_proc_fops_status);
+ 
++	/* BF7: удержание питания на гнезде, см. выше */
++	proc_create("driver/camsensor_power", 0664, NULL,
++		    &fcamera_proc_fops_bf7_power);
++
+ 	/* Camera information */
+ 	proc_create(PROC_CAMERA_INFO, 0664, NULL, &fcamera_proc_fops1);
+ 
+diff --git a/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/imgsensor_cfg_table.c b/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/imgsensor_cfg_table.c
+index 60aa045e5..278dd9cd3 100644
+--- a/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/imgsensor_cfg_table.c
++++ b/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/imgsensor_cfg_table.c
+@@ -28,9 +28,22 @@ struct IMGSENSOR_HW_CFG imgsensor_custom_config[] = {
+ 		IMGSENSOR_I2C_DEV_0,
+ 		{
+ 			{IMGSENSOR_HW_ID_MCLK, IMGSENSOR_HW_PIN_MCLK},
+-			{IMGSENSOR_HW_ID_REGULATOR, IMGSENSOR_HW_PIN_AVDD},
++			/*
++			 * BF7: раздача выводов питания взята с общей площадки
++			 * mt6761 и нашей плате не соответствует. По дереву
++			 * устройств (kd_camera_hw1@15040000) у нас так:
++			 *   аналоговое AVDD  — ножкой, есть pinctrl
++			 *                      cam0_vcama_on/cam0_vcama_off;
++			 *   цифровое  DVDD  — от PMIC, cam0_vcamd-supply;
++			 *   ввод-вывод DOVDD — от PMIC, cam0_vcamio-supply.
++			 * До правки AVDD искали у регулятора с именем
++			 * cam0_vcama, которого в дереве нет, получали NULL
++			 * ("regulator == NULL 0 3 3" в журнале) и шли дальше
++			 * без питания — сенсор молчал по I2C.
++			 */
++			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_AVDD},
+ 			{IMGSENSOR_HW_ID_REGULATOR, IMGSENSOR_HW_PIN_DOVDD},
+-			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_DVDD},
++			{IMGSENSOR_HW_ID_REGULATOR, IMGSENSOR_HW_PIN_DVDD},
+ 			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_PDN},
+ 			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_RST},
+ 			{IMGSENSOR_HW_ID_NONE, IMGSENSOR_HW_PIN_NONE},
+@@ -41,9 +54,14 @@ struct IMGSENSOR_HW_CFG imgsensor_custom_config[] = {
+ 		IMGSENSOR_I2C_DEV_1,
+ 		{
+ 			{IMGSENSOR_HW_ID_MCLK, IMGSENSOR_HW_PIN_MCLK},
++			/*
++			 * BF7: AVDD ножкой (cam1_vcama_on/off) — так и было
++			 * верно; DVDD у нас от PMIC (cam1_vcamd-supply), а не
++			 * ножкой. Подробности — в записи для основной камеры.
++			 */
+ 			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_AVDD},
+ 			{IMGSENSOR_HW_ID_REGULATOR, IMGSENSOR_HW_PIN_DOVDD},
+-			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_DVDD},
++			{IMGSENSOR_HW_ID_REGULATOR, IMGSENSOR_HW_PIN_DVDD},
+ 			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_PDN},
+ 			{IMGSENSOR_HW_ID_GPIO, IMGSENSOR_HW_PIN_RST},
+ 			{IMGSENSOR_HW_ID_NONE, IMGSENSOR_HW_PIN_NONE},
+@@ -186,6 +204,33 @@ struct IMGSENSOR_HW_POWER_SEQ sensor_power_sequence[] = {
+ 		},
+ 	},
+ #endif
++#if defined(HI556_MIPI_RAW)
++	/*
++	 * BF7: записи для HI556 у MediaTek нет ни на одной площадке этого
++	 * дерева и ни в одном из донорских. Без неё
++	 * imgsensor_hw_power_sequence() не находит имя и выходит, не подав на
++	 * гнездо ровно ничего — именно так переднее гнездо оказалось
++	 * полностью обесточенным: на i2c-4 молчал даже EEPROM, который на
++	 * главном гнезде отвечает исправно.
++	 *
++	 * Порядок собран по образцу соседних записей и по разводке нашей
++	 * платы (см. imgsensor_custom_config выше): DOVDD 1,8 В и DVDD 1,2 В
++	 * идут от PMIC, AVDD 2,8 В — ножкой (cam1_vcama_on), сброс снимается
++	 * последним. Задержки взяты с запасом: это отладочный путь, лишняя
++	 * миллисекунда роли не играет.
++	 */
++	{
++		SENSOR_DRVNAME_HI556_MIPI_RAW,
++		{
++			{SensorMCLK, Vol_High, 0},
++			{RST, Vol_Low, 1},
++			{DOVDD, Vol_1800, 1},
++			{DVDD, Vol_1200, 1},
++			{AVDD, Vol_2800, 2},
++			{RST, Vol_High, 5},
++		},
++	},
++#endif
+ #if defined(SP250ASUB2_MIPI_RAW)
+ 	{
+ 		SENSOR_DRVNAME_SP250ASUB2_MIPI_RAW,
+diff --git a/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/mclk/mclk.c b/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/mclk/mclk.c
+index a64fb7f29..435767e39 100644
+--- a/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/mclk/mclk.c
++++ b/drivers/misc/mediatek/imgsensor/src/mt6761/camera_hw/mclk/mclk.c
+@@ -5,6 +5,13 @@
+ 
+ #include "mclk.h"
+ 
++/* BF7: ради pgimgsensor->clk и imgsensor_clk_set() — см. mclk_set() ниже */
++#include "imgsensor.h"
++#include "imgsensor_clk.h"
++
++/* объявлен в imgsensor_proc.h, а его тянуть сюда незачем */
++extern struct IMGSENSOR *pgimgsensor;
++
+ struct MCLK_PINCTRL_NAMES mclk_pinctrl_list[MCLK_STATE_MAX_NUM] = {
+ 	{"off"}, {"on"},
+ };
+@@ -109,6 +116,48 @@ static enum IMGSENSOR_RETURN mclk_set(
+ 		state_index = (pin_state > IMGSENSOR_HW_PIN_STATE_LEVEL_0)
+ 		    ? MCLK_STATE_ENABLE : MCLK_STATE_DISABLE;
+ 
++		/*
++		 * BF7: сам тактовый сигнал тоже включаем здесь.
++		 *
++		 * Ниже происходит только выбор состояния pinctrl — ножка
++		 * переводится в режим CMMCLK. А источник тактов штатно включает
++		 * imgsensor_clk_set() из ioctl SENSOR_FEATURE_SET_MCLK, то есть
++		 * из андроидного HAL. Без HAL получалось так: мультиплексор на
++		 * ножке есть, а сигнала нет. Samsung S5K3L6 в таком виде не
++		 * отвечает по шине вовсе — из-за этого главная камера полдня
++		 * выглядела неисправной (2026-09-17).
++		 *
++		 * Какой мультиплексор кому: это видно не из драйвера, а из
++		 * дерева устройств вместе с таблицей выводов MT6761.
++		 *   cam0_mclk_on -> GPIO100, режим 1 = CMMCLK1 -> camtg1_sel
++		 *   cam1_mclk_on -> GPIO99,  режим 1 = CMMCLK0 -> camtg_sel
++		 * То есть нумерация гнёзд и нумерация CMMCLK переставлены
++		 * местами, и «TG = номер гнезда» здесь неверно.
++		 *
++		 * 24 МГц — то, что просят обе наши записи в таблице питания.
++		 * Позже HAL (или наш будущий пользовательский слой) может
++		 * переспросить другую частоту через SET_MCLK: вызовы
++		 * imgsensor_clk_set() считаются по ссылкам, наш просто первый.
++		 */
++		{
++			static const unsigned int bf7_tg_of_socket[] = {
++				1, 0, 2, 3
++			};
++			struct ACDK_SENSOR_MCLK_STRUCT bf7_mclk;
++
++			if ((unsigned int)sensor_idx <
++			    ARRAY_SIZE(bf7_tg_of_socket)) {
++				memset(&bf7_mclk, 0, sizeof(bf7_mclk));
++				bf7_mclk.TG =
++				 (MUINT8)bf7_tg_of_socket[(unsigned int)sensor_idx];
++				bf7_mclk.freq = 24;
++				bf7_mclk.on =
++				 (MUINT8)(state_index == MCLK_STATE_ENABLE);
++
++				imgsensor_clk_set(&pgimgsensor->clk, &bf7_mclk);
++			}
++		}
++
+ 		ppinctrl_state =
+ pinst->ppinctrl_state[(unsigned int)sensor_idx][(unsigned int)state_index];
+ 		mutex_lock(&pinctrl_mutex);

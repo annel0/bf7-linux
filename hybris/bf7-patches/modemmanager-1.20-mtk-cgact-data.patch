@@ -1,0 +1,557 @@
+Description: MediaTek data path: +CGACT, ccmni net port, static IP from +CGCONTRDP
+ MediaTek modems have no PPP on the AT port (ATD*99# is taken as a voice
+ call). With ID_MM_BF7_MTK_DATA=1 on the net port the generic bearer
+ activates the context with +CGACT, returns the net port and reads the
+ IPv4 settings with +CGCONTRDP. Other modems are unaffected.
+Author: bf7
+Forwarded: not-needed
+
+Index: modemmanager-1.20.4/src/mm-broadband-bearer.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-broadband-bearer.c	2026-09-23 17:11:08.089217573 +0300
++++ modemmanager-1.20.4/src/mm-broadband-bearer.c	2026-09-23 17:55:39.463501986 +0300
+@@ -524,6 +524,215 @@
+     g_object_unref (task);
+ }
+ 
++/*****************************************************************************/
++/* MediaTek data path (BF7)
++ *
++ * The MediaTek modem has no PPP on its AT port: ATD*99# is taken as a voice
++ * call and the port stops answering. Data goes through the ccmni network
++ * interface instead: the PDP context is activated with +CGACT, the modem
++ * brings the interface up by itself, and the IP settings are read back with
++ * +CGCONTRDP. Enabled only when the net port carries the udev property
++ * ID_MM_BF7_MTK_DATA=1, so every other modem keeps the generic behaviour.
++ */
++
++static gboolean
++bf7_is_mtk_net_port (MMPort *port)
++{
++    MMKernelDevice *kernel_device;
++
++    if (!port || mm_port_get_port_type (port) != MM_PORT_TYPE_NET)
++        return FALSE;
++    kernel_device = mm_port_peek_kernel_device (port);
++    return (kernel_device &&
++            mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_DATA"));
++}
++
++static MMPort *
++bf7_peek_mtk_net_port (MMBaseModem *modem)
++{
++    MMPort *net;
++
++    net = mm_base_modem_peek_best_data_port (modem, MM_PORT_TYPE_NET);
++    mm_obj_dbg (modem, "MediaTek data port: %s", net ? mm_port_get_device (net) : "none");
++    return bf7_is_mtk_net_port (net) ? net : NULL;
++}
++
++/* The modem itself is tagged on its primary AT port */
++static gboolean
++bf7_is_mtk_modem (MMBaseModem *modem)
++{
++    MMPortSerialAt *primary;
++    MMKernelDevice *kernel_device;
++
++    primary = mm_base_modem_peek_port_primary (modem);
++    kernel_device = primary ? mm_port_peek_kernel_device (MM_PORT (primary)) : NULL;
++    return (kernel_device &&
++            mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_DATA"));
++}
++
++static gboolean
++bf7_is_ipv4 (const gchar *str)
++{
++    g_autoptr(GInetAddress) address = NULL;
++
++    address = str ? g_inet_address_new_from_string (str) : NULL;
++    return (address && g_inet_address_get_family (address) == G_SOCKET_FAMILY_IPV4);
++}
++
++static guint
++bf7_prefix_from_mask (const gchar *mask)
++{
++    guint  a, b, c, d, prefix = 0;
++    guint32 bits;
++
++    if (!mask || sscanf (mask, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
++        a > 255 || b > 255 || c > 255 || d > 255)
++        return 32;
++    bits = (a << 24) | (b << 16) | (c << 8) | d;
++    while (bits & 0x80000000) {
++        prefix++;
++        bits <<= 1;
++    }
++    /* Not a contiguous mask, or nonsense like 0.0.0.0: point to point */
++    if (bits || prefix < 8)
++        return 32;
++    return prefix;
++}
++
++/* The modem binds each new context to the next ccmni interface in turn
++ * (100 -> ccmni0, 504 -> ccmni4, 605 -> ccmni5 ...) and says which one in
++ * "+EIF: <id>, ifup, ..."; the interface is ccmni<id % 100>. */
++static void
++bf7_eif_received (MMPortSerialAt *port,
++                  GMatchInfo     *info,
++                  MMBaseModem    *modem)
++{
++    g_autofree gchar *line = NULL;
++    guint             id = 0;
++    gchar             state[16] = "";
++
++    line = g_match_info_fetch (info, 0);
++    if (!line)
++        return;
++    g_strstrip (line);
++    mm_obj_dbg (modem, "MediaTek interface report: %s", line);
++    if (sscanf (line, "+EIF: %u, %15[a-z]", &id, state) == 2 && g_str_equal (state, "ifup"))
++        g_object_set_data (G_OBJECT (modem), "bf7-eif-ifup", GUINT_TO_POINTER (id + 1));
++}
++
++static void
++bf7_listen_eif (MMBaseModem    *modem,
++                MMPortSerialAt *primary)
++{
++    g_autoptr(GRegex) r = NULL;
++
++    r = g_regex_new ("\\r\\n\\+EIF:[^\\r\\n]*\\r\\n", G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
++    mm_port_serial_at_add_unsolicited_msg_handler (primary, r,
++                                                   (MMPortSerialAtUnsolicitedMsgFn)bf7_eif_received,
++                                                   modem, NULL);
++}
++
++typedef struct {
++    MMBaseModem *modem;
++    guint        cid;
++    guint        tries;
++} Bf7DialContext;
++
++static void
++bf7_dial_context_free (Bf7DialContext *ctx)
++{
++    g_object_unref (ctx->modem);
++    g_slice_free (Bf7DialContext, ctx);
++}
++
++static void
++bf7_dial_fail (GTask  *task,
++               GError *error)
++{
++    Bf7DialContext *ctx = g_task_get_task_data (task);
++    MMPortSerialAt *primary;
++    gchar          *command;
++
++    /* The context is up but unusable: take it down again */
++    primary = mm_base_modem_peek_port_primary (ctx->modem);
++    if (primary) {
++        command = g_strdup_printf ("+CGACT=0,%u", ctx->cid);
++        mm_base_modem_at_command_full (ctx->modem, primary, command, 45,
++                                       FALSE, FALSE, NULL, NULL, NULL);
++        g_free (command);
++    }
++    g_task_return_error (task, error);
++    g_object_unref (task);
++}
++
++static gboolean
++bf7_wait_eif (GTask *task)
++{
++    Bf7DialContext *ctx = g_task_get_task_data (task);
++    guint           v;
++    GList          *l;
++    g_autofree gchar *name = NULL;
++
++    v = GPOINTER_TO_UINT (g_object_get_data (G_OBJECT (ctx->modem), "bf7-eif-ifup"));
++    if (!v) {
++        if (++ctx->tries < 50)
++            return G_SOURCE_CONTINUE;
++        bf7_dial_fail (task, g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                          "MediaTek modem did not report the data interface"));
++        return G_SOURCE_REMOVE;
++    }
++
++    name = g_strdup_printf ("ccmni%u", (v - 1) % 100);
++    for (l = mm_base_modem_peek_data_ports (ctx->modem); l; l = g_list_next (l)) {
++        MMPort *port = MM_PORT (l->data);
++
++        if (bf7_is_mtk_net_port (port) && g_str_equal (mm_port_get_device (port), name)) {
++            mm_obj_dbg (ctx->modem, "context %u is on %s", ctx->cid, name);
++            g_task_return_pointer (task, g_object_ref (port), g_object_unref);
++            g_object_unref (task);
++            return G_SOURCE_REMOVE;
++        }
++    }
++    bf7_dial_fail (task, g_error_new (MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                      "MediaTek data interface %s is not a port of this modem", name));
++    return G_SOURCE_REMOVE;
++}
++
++static void
++bf7_cgact_dial_ready (MMBaseModem  *modem,
++                      GAsyncResult *res,
++                      GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!mm_base_modem_at_command_full_finish (modem, res, &error)) {
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    /* "+EIF: ... ifup" may come before or after OK: wait up to 5 s */
++    if (bf7_wait_eif (task) == G_SOURCE_CONTINUE)
++        g_timeout_add (100, (GSourceFunc)bf7_wait_eif, task);
++}
++
++static void
++bf7_cgact_disconnect_ready (MMBaseModem  *modem,
++                            GAsyncResult *res,
++                            GTask        *task)
++{
++    GError *error = NULL;
++
++    if (!mm_base_modem_at_command_full_finish (modem, res, &error)) {
++        mm_obj_dbg (g_task_get_source_object (task),
++                    "PDP context deactivation failed (not fatal): %s", error->message);
++        g_error_free (error);
++    }
++    g_task_return_boolean (task, TRUE);
++    g_object_unref (task);
++}
++
++
+ static void
+ dial_3gpp (MMBroadbandBearer *self,
+            MMBaseModem *modem,
+@@ -540,6 +749,41 @@
+ 
+     g_assert (primary != NULL);
+ 
++    /* MediaTek: activate the context; the modem picks the net port itself.
++     * Never fall back to ATD*99#: the modem takes it as a voice call and the
++     * AT port stops answering. */
++    if (bf7_is_mtk_modem (modem)) {
++        Bf7DialContext *bctx;
++
++        if (!bf7_peek_mtk_net_port (modem)) {
++            g_task_report_new_error (self, callback, user_data, dial_3gpp,
++                                     MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                     "MediaTek modem: no ccmni net port for data");
++            return;
++        }
++        bf7_listen_eif (modem, primary);
++        g_object_set_data (G_OBJECT (modem), "bf7-eif-ifup", NULL);
++
++        bctx = g_slice_new0 (Bf7DialContext);
++        bctx->modem = g_object_ref (modem);
++        bctx->cid = cid;
++        task = g_task_new (self, cancellable, callback, user_data);
++        g_task_set_task_data (task, bctx, (GDestroyNotify)bf7_dial_context_free);
++        mm_obj_dbg (self, "activating PDP context %u", cid);
++        command = g_strdup_printf ("+CGACT=1,%u", cid);
++        mm_base_modem_at_command_full (modem,
++                                       primary,
++                                       command,
++                                       MM_BASE_BEARER_DEFAULT_CONNECTION_TIMEOUT,
++                                       FALSE,
++                                       FALSE, /* raw */
++                                       NULL, /* cancellable */
++                                       (GAsyncReadyCallback)bf7_cgact_dial_ready,
++                                       task);
++        g_free (command);
++        return;
++    }
++
+     ctx = g_slice_new0 (Dial3gppContext);
+     ctx->modem = g_object_ref (modem);
+     ctx->primary = g_object_ref (primary);
+@@ -689,6 +933,180 @@
+  * 4) Initiate call.
+  */
+ 
++/* MediaTek: a context activated but left unusable must not stay up */
++static void
++bf7_deactivate (MMBroadbandBearer      *self,
++                DetailedConnectContext *ctx)
++{
++    gchar *command;
++
++    command = g_strdup_printf ("+CGACT=0,%d", self->priv->profile_id);
++    mm_base_modem_at_command_full (ctx->modem, ctx->primary, command, 45,
++                                   FALSE, FALSE, NULL, NULL, NULL);
++    g_free (command);
++}
++
++static void bf7_cgcontrdp_ready (MMBaseModem  *modem,
++                                 GAsyncResult *res,
++                                 GTask        *task);
++
++/* MediaTek: the address of the context, from +CGPADDR: <cid>,"<addr>"[,...] */
++static void
++bf7_cgpaddr_ready (MMBaseModem  *modem,
++                   GAsyncResult *res,
++                   GTask        *task)
++{
++    MMBroadbandBearer *self;
++    DetailedConnectContext *ctx;
++    const gchar *response;
++    gchar *command;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_full_finish (modem, res, NULL);
++    if (response) {
++        const gchar *p = strstr (response, "+CGPADDR:");
++        g_auto(GStrv) fields = NULL;
++        guint i;
++
++        fields = p ? g_strsplit (p + strlen ("+CGPADDR:"), ",", -1) : NULL;
++        for (i = 1; fields && fields[i]; i++) {
++            gchar *f = g_strstrip (fields[i]);
++            gsize  n = strlen (f);
++
++            if (n >= 2 && f[0] == '"' && f[n - 1] == '"') {
++                f[n - 1] = '\0';
++                f++;
++            }
++            if (bf7_is_ipv4 (f) && !g_str_equal (f, "0.0.0.0")) {
++                g_object_set_data_full (G_OBJECT (task), "bf7-address", g_strdup (f), g_free);
++                break;
++            }
++        }
++    }
++
++    command = g_strdup_printf ("+CGCONTRDP=%d", self->priv->profile_id);
++    mm_base_modem_at_command_full (ctx->modem, ctx->primary, command, 10,
++                                   FALSE, FALSE, NULL,
++                                   (GAsyncReadyCallback)bf7_cgcontrdp_ready, task);
++    g_free (command);
++}
++
++/* MediaTek: static IPv4 settings of the active context, from +CGCONTRDP */
++static void
++bf7_cgcontrdp_ready (MMBaseModem  *modem,
++                     GAsyncResult *res,
++                     GTask        *task)
++{
++    MMBroadbandBearer                *self;
++    DetailedConnectContext           *ctx;
++    const gchar                      *response;
++    GError                           *error = NULL;
++    g_auto(GStrv)                     lines = NULL;
++    g_autofree gchar                 *address = NULL;
++    g_autofree gchar                 *subnet = NULL;
++    g_autofree gchar                 *dns1 = NULL;
++    g_autofree gchar                 *dns2 = NULL;
++    const gchar                      *dns[3] = { NULL, NULL, NULL };
++    guint                             n_dns = 0;
++    guint                             i;
++    g_autoptr(MMBearerIpConfig)       ipv4_config = NULL;
++    g_autoptr(MMBearerConnectResult)  result = NULL;
++
++    self = g_task_get_source_object (task);
++    ctx  = g_task_get_task_data (task);
++
++    response = mm_base_modem_at_command_full_finish (modem, res, &error);
++    if (!response) {
++        bf7_deactivate (self, ctx);
++        g_task_return_error (task, error);
++        g_object_unref (task);
++        return;
++    }
++
++    /* One line per address family; take the IPv4 one. The MediaTek modem
++     * leaves the address field empty and gives only DNS here; the address
++     * then comes from +CGPADDR, asked before. MM's own parser can't be used:
++     * with an empty address field it takes the subnet from the next field
++     * and shifts the DNS servers by one. */
++    lines = g_strsplit_set (response, "\r\n", -1);
++    for (i = 0; lines[i] && !dns1; i++) {
++        g_auto(GStrv) f = NULL;
++        guint         n, j;
++
++        g_strstrip (lines[i]);
++        if (!g_str_has_prefix (lines[i], "+CGCONTRDP:"))
++            continue;
++        f = g_strsplit (lines[i] + strlen ("+CGCONTRDP:"), ",", -1);
++        n = g_strv_length (f);
++        for (j = 0; j < n; j++) {
++            gchar *v = g_strstrip (f[j]);
++            gsize  k = strlen (v);
++
++            if (k >= 2 && v[0] == '"' && v[k - 1] == '"') {
++                memmove (v, v + 1, k - 2);
++                v[k - 2] = '\0';
++            }
++        }
++        if (n < 4)
++            continue;
++        /* f[3]: "a.b.c.d.m.m.m.m" (27.007 >= v9.4.0), "a.b.c.d" (older, mask
++         * in f[4]) or empty (MediaTek, newer layout) */
++        {
++            g_auto(GStrv) o = g_strsplit (f[3], ".", -1);
++            guint         no = g_strv_length (o);
++            guint         d;
++
++            if (no == 8) {
++                address = g_strdup_printf ("%s.%s.%s.%s", o[0], o[1], o[2], o[3]);
++                subnet  = g_strdup_printf ("%s.%s.%s.%s", o[4], o[5], o[6], o[7]);
++                d = 5;
++            } else if (no == 4) {
++                address = g_strdup (f[3]);
++                subnet  = n > 4 ? g_strdup (f[4]) : NULL;
++                d = 6;
++            } else
++                d = 5;
++            if (address && !bf7_is_ipv4 (address))
++                g_clear_pointer (&address, g_free);
++            if (n > d && bf7_is_ipv4 (f[d]))
++                dns1 = g_strdup (f[d]);
++            if (n > d + 1 && bf7_is_ipv4 (f[d + 1]))
++                dns2 = g_strdup (f[d + 1]);
++        }
++    }
++
++    if (!address)
++        address = g_strdup (g_object_get_data (G_OBJECT (task), "bf7-address"));
++    if (!address) {
++        bf7_deactivate (self, ctx);
++        g_task_return_new_error (task, MM_CORE_ERROR, MM_CORE_ERROR_FAILED,
++                                 "No IPv4 address in +CGPADDR or +CGCONTRDP response");
++        g_object_unref (task);
++        return;
++    }
++
++    if (bf7_is_ipv4 (dns1) && !g_str_equal (dns1, "0.0.0.0"))
++        dns[n_dns++] = dns1;
++    if (bf7_is_ipv4 (dns2) && !g_str_equal (dns2, "0.0.0.0"))
++        dns[n_dns++] = dns2;
++
++    ipv4_config = mm_bearer_ip_config_new ();
++    mm_bearer_ip_config_set_method (ipv4_config, MM_BEARER_IP_METHOD_STATIC);
++    mm_bearer_ip_config_set_address (ipv4_config, address);
++    mm_bearer_ip_config_set_prefix (ipv4_config, bf7_prefix_from_mask (subnet));
++    if (n_dns)
++        mm_bearer_ip_config_set_dns (ipv4_config, dns);
++    mm_obj_dbg (self, "context %d settings: %s/%u, %u DNS server(s)",
++                self->priv->profile_id, address, bf7_prefix_from_mask (subnet), n_dns);
++
++    result = mm_bearer_connect_result_new (ctx->data, ipv4_config, NULL);
++    mm_bearer_connect_result_set_profile_id (result, self->priv->profile_id);
++    g_task_return_pointer (task, g_steal_pointer (&result), (GDestroyNotify)mm_bearer_connect_result_unref);
++    g_object_unref (task);
++}
++
+ static void
+ get_ip_config_3gpp_ready (MMBroadbandBearer *self,
+                           GAsyncResult      *res,
+@@ -749,6 +1167,24 @@
+     if (MM_IS_PORT_SERIAL_AT (ctx->data))
+         ctx->close_data_on_exit = TRUE;
+ 
++    /* MediaTek: the modem assigns the address, read it back */
++    if (bf7_is_mtk_net_port (ctx->data)) {
++        gchar *command;
++
++        command = g_strdup_printf ("+CGPADDR=%d", self->priv->profile_id);
++        mm_base_modem_at_command_full (ctx->modem,
++                                       ctx->primary,
++                                       command,
++                                       10,
++                                       FALSE,
++                                       FALSE, /* raw */
++                                       NULL, /* cancellable */
++                                       (GAsyncReadyCallback)bf7_cgpaddr_ready,
++                                       task);
++        g_free (command);
++        return;
++    }
++
+     if (MM_BROADBAND_BEARER_GET_CLASS (self)->get_ip_config_3gpp &&
+         MM_BROADBAND_BEARER_GET_CLASS (self)->get_ip_config_3gpp_finish) {
+         /* Launch specific IP config retrieval */
+@@ -1415,6 +1851,27 @@
+ 
+     g_assert (primary != NULL);
+ 
++    /* MediaTek: deactivating the context takes the net port down */
++    if (bf7_is_mtk_net_port (data)) {
++        gchar *command;
++
++        task = g_task_new (self, NULL, callback, user_data);
++        command = (cid > 0 ?
++                   g_strdup_printf ("+CGACT=0,%u", cid) :
++                   g_strdup ("+CGACT=0"));
++        mm_base_modem_at_command_full (MM_BASE_MODEM (modem),
++                                       primary,
++                                       command,
++                                       45,
++                                       FALSE,
++                                       FALSE, /* raw */
++                                       NULL, /* cancellable */
++                                       (GAsyncReadyCallback)bf7_cgact_disconnect_ready,
++                                       task);
++        g_free (command);
++        return;
++    }
++
+     /* Generic 3GPP plays only with SERIAL data ports */
+     g_assert (MM_IS_PORT_SERIAL (data));
+ 
+Index: modemmanager-1.20.4/src/mm-base-modem.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-base-modem.c	2022-12-31 16:42:31.000000000 +0300
++++ modemmanager-1.20.4/src/mm-base-modem.c	2026-09-23 17:39:14.357919506 +0300
+@@ -1585,9 +1585,21 @@
+     self->priv->gps = (gps ? g_object_ref (gps) : NULL);
+ 
+     /* Append net ports to the final list of data ports, but only if the modem
+-     * supports them */
++     * supports them. A MediaTek ccmni port tagged ID_MM_BF7_MTK_DATA=1 is
++     * always taken: the generic modem has no net data support, but the
++     * generic bearer drives it with +CGACT (BF7). */
+     if (data_net) {
+-        if (self->priv->data_net_supported) {
++        gboolean bf7_mtk_net = FALSE;
++
++        for (l = data_net; l; l = g_list_next (l)) {
++            MMKernelDevice *kernel_device;
++
++            kernel_device = mm_port_peek_kernel_device (MM_PORT (l->data));
++            if (kernel_device &&
++                mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_DATA"))
++                bf7_mtk_net = TRUE;
++        }
++        if (self->priv->data_net_supported || bf7_mtk_net) {
+             g_list_foreach (data_net, (GFunc)g_object_ref, NULL);
+             self->priv->data = g_list_concat (self->priv->data, g_steal_pointer (&data_net));
+         } else
+Index: modemmanager-1.20.4/src/mm-broadband-modem.c
+===================================================================
+--- modemmanager-1.20.4.orig/src/mm-broadband-modem.c	2026-09-23 17:40:33.000000000 +0300
++++ modemmanager-1.20.4/src/mm-broadband-modem.c	2026-09-23 17:55:39.000000000 +0300
+@@ -10510,6 +10510,20 @@
+             checked = TRUE;
+     }
+ 
++    /* MediaTek (BF7): context 0 is the LTE attach bearer of the modem itself,
++     * +CGACT on it fails with error 5745; user contexts start at 1 */
++    if (checked && ctx->min_profile_id == 0) {
++        MMPortSerialAt *primary;
++        MMKernelDevice *kernel_device = NULL;
++
++        primary = mm_base_modem_peek_port_primary (self);
++        if (primary)
++            kernel_device = mm_port_peek_kernel_device (MM_PORT (primary));
++        if (kernel_device &&
++            mm_kernel_device_get_property_as_boolean (kernel_device, "ID_MM_BF7_MTK_DATA"))
++            ctx->min_profile_id = 1;
++    }
++
+     if (!checked) {
+         ctx->min_profile_id = 1;
+         ctx->max_profile_id = G_MAXINT-1;

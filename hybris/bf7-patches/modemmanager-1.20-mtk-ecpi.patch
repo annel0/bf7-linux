@@ -1,0 +1,120 @@
+Index: modemmanager-1.20.4/src/mm-broadband-modem.c
+===================================================================
+--- a/src/mm-broadband-modem.c	2026-09-23 18:55:14.566148401 +0300
++++ b/src/mm-broadband-modem.c	2026-09-24 08:29:42.147906952 +0300
+@@ -8186,6 +8186,71 @@
+     mm_base_modem_at_command (MM_BASE_MODEM (self), command, 5, FALSE, NULL, NULL);
+ }
+ 
++/* BF7: MTK has no +CLCC; the real progress of an outgoing call comes in
++ * +ECPI: <id>,<type>,... (type 2 = alerting, the remote party rings; type 6 =
++ * connected). Without this the call went ACTIVE right after the OK to ATD,
++ * before the first ring: calls apps showed a running call and a voice
++ * greeting was played into the ringback. Only outgoing calls in
++ * DIALING/RINGING_OUT are touched; incoming ones are driven by ATA as before.
++ * The regex leaves the trailing CRLF in place (lookahead): +CIEV often comes
++ * right after +ECPI and its own handler needs that CRLF as its prefix, else
++ * it lands in the ATD response and the call start fails. */
++typedef struct {
++    MMCallState state;
++    guint       index;
++    gboolean    done;
++} Bf7EcpiContext;
++
++static void
++bf7_ecpi_foreach (MMBaseCall     *call,
++                  Bf7EcpiContext *ctx)
++{
++    MMCallState current;
++
++    if (ctx->done || mm_base_call_get_direction (call) != MM_CALL_DIRECTION_OUTGOING)
++        return;
++    current = mm_base_call_get_state (call);
++    if (current != MM_CALL_STATE_DIALING && current != MM_CALL_STATE_RINGING_OUT)
++        return;
++    ctx->done = TRUE;
++    if (ctx->index && !mm_base_call_get_index (call))
++        mm_base_call_set_index (call, ctx->index);
++    if (current != ctx->state)
++        mm_base_call_change_state (call, ctx->state,
++                                   ctx->state == MM_CALL_STATE_ACTIVE ?
++                                   MM_CALL_STATE_REASON_ACCEPTED :
++                                   MM_CALL_STATE_REASON_OUTGOING_STARTED);
++}
++
++static void
++bf7_ecpi_received (MMPortSerialAt   *port,
++                   GMatchInfo       *info,
++                   MMBroadbandModem *self)
++{
++    g_autoptr(MMCallList) list = NULL;
++    Bf7EcpiContext        ctx = { 0 };
++    guint                 id = 0;
++    guint                 type = 0;
++
++    if (!mm_get_uint_from_match_info (info, 1, &id) ||
++        !mm_get_uint_from_match_info (info, 2, &type))
++        return;
++    if (type == 2)
++        ctx.state = MM_CALL_STATE_RINGING_OUT;
++    else if (type == 6)
++        ctx.state = MM_CALL_STATE_ACTIVE;
++    else
++        return;
++    ctx.index = id;
++
++    g_object_get (self, MM_IFACE_MODEM_VOICE_CALL_LIST, &list, NULL);
++    if (!list)
++        return;
++    mm_call_list_foreach (list, (MMCallListForeachFunc) bf7_ecpi_foreach, &ctx);
++    mm_obj_dbg (self, "+ECPI %u,%u: %s", id, type,
++                ctx.done ? "outgoing call updated" : "no outgoing call to update");
++}
++
+ static void
+ set_voice_unsolicited_events_handlers (MMIfaceModemVoice *self,
+                                        gboolean enable,
+@@ -8198,6 +8263,7 @@
+     g_autoptr(GRegex)  clip_regex = NULL;
+     g_autoptr(GRegex)  ccwa_regex = NULL;
+     g_autoptr(GRegex)  eaic_regex = NULL;
++    g_autoptr(GRegex)  ecpi_regex = NULL;
+     guint              i;
+     GTask             *task;
+ 
+@@ -8208,6 +8274,9 @@
+     if (bf7_is_mtk_voice (MM_BROADBAND_MODEM (self)))
+         eaic_regex = g_regex_new ("\\r\\n\\+EAIC:\\s*(\\d+),\\s*(?:\"[^\"]*\"|[^,]*),\\s*\\d*,\\s*\\d*,\\s*(\\d+)[^\\r\\n]*\\r\\n",
+                                   G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
++    if (bf7_is_mtk_voice (MM_BROADBAND_MODEM (self)))
++        ecpi_regex = g_regex_new ("\\r\\n\\+ECPI:\\s*(\\d+),\\s*(\\d+),[^\\r\\n]*(?=\\r\\n)",
++                                  G_REGEX_RAW | G_REGEX_OPTIMIZE, 0, NULL);
+     ports[0] = mm_base_modem_peek_port_primary (MM_BASE_MODEM (self));
+     ports[1] = mm_base_modem_peek_port_secondary (MM_BASE_MODEM (self));
+ 
+@@ -8251,6 +8320,13 @@
+                 enable ? (MMPortSerialAtUnsolicitedMsgFn) bf7_eaic_received : NULL,
+                 enable ? self : NULL,
+                 NULL);
++        if (ecpi_regex)
++            mm_port_serial_at_add_unsolicited_msg_handler (
++                ports[i],
++                ecpi_regex,
++                enable ? (MMPortSerialAtUnsolicitedMsgFn) bf7_ecpi_received : NULL,
++                enable ? self : NULL,
++                NULL);
+     }
+ 
+     task = g_task_new (self, NULL, callback, user_data);
+@@ -8478,8 +8554,9 @@
+                               * Also, we're able to support detailed call state updates without
+                               * additional vendor-specific commands. */
+                              self->priv->clcc_supported,   /* skip incoming timeout */
+-                             self->priv->clcc_supported,   /* dialing->ringing supported */
+-                             self->priv->clcc_supported);  /* ringing->active supported */
++                             /* BF7: MTK reports dialing->ringing->active in +ECPI */
++                             self->priv->clcc_supported || bf7_is_mtk_voice (self),   /* dialing->ringing supported */
++                             self->priv->clcc_supported || bf7_is_mtk_voice (self));  /* ringing->active supported */
+ }
+ 
+ /*****************************************************************************/

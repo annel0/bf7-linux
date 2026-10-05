@@ -1,0 +1,32 @@
+[Unit]
+# BF7: запуск модема и сервер его файлов (ccci_mdinit 0, внутри — fsd).
+#
+# Подпорки через LD_PRELOAD:
+#   libbf7prop      — свойств Android нет; ccci_mdinit в цикле ждёт
+#                     vendor.service.nvram_restore=Ready (в bf7.prop);
+#   libselinux-stub — SELinux выключен;
+#   libbf7wakelock  — wakelock через /sys/power/wake_lock, а не через
+#                     ISystemSuspend, которого у нас нет (fsd ждал его вечно).
+# Имя процесса должно остаться ccci_mdinit: ядро пускает ioctl запуска
+# модема только от него.
+Description=Модем MediaTek (ccci_mdinit)
+After=bf7-nvram-hal.service bf7-ccci-rpcd.service bf7-modem-mounts.service
+Requires=bf7-nvram-hal.service bf7-ccci-rpcd.service bf7-modem-mounts.service
+# Мост AT держать, пока модем жив: после перезапуска ccci_mdinit (а с ним
+# и модема) BindsTo гасит мост, а Upholds поднимает его снова.
+Upholds=bf7-modem-at.service
+
+[Service]
+ExecStartPre=/bin/mkdir -p /data/vendor/mdlpm /data/vendor_de/md /data/vendor/md3
+# LD_PRELOAD — только демону, не через Environment=: иначе он достаётся и
+# ExecStartPre (glibc-овский mkdir не грузит бионик-заглушки и падает, 127).
+# env делает exec, так что имя процесса остаётся ccci_mdinit.
+ExecStart=/usr/bin/env LD_PRELOAD=/vendor.local/lib64/libbf7prop.so:/vendor.local/lib64/libselinux-stub.so:/vendor.local/lib64/libbf7wakelock.so /vendor/bin/ccci_mdinit 0
+# Бионик-линкер ворчит про /linkerconfig — не ошибка; журнал демона идёт
+# через liblog в /var/log/bf7-android.log.
+StandardError=null
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

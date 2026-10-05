@@ -1,0 +1,13 @@
+[Unit]
+Description=Взять трубку, когда звонит хозяин (голосовой разговор с Клаудом)
+After=ModemManager.service
+ConditionPathExists=/etc/bf7/hozyain-nomer
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/bf7-hozyain
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Правила межсетевого экрана BF7
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=network-pre.target sysinit.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bf7-firewall
+ExecStop=/bin/sh -c 'iptables -P INPUT ACCEPT; iptables -F INPUT; ip6tables -P INPUT ACCEPT; ip6tables -F INPUT'
+
+[Install]
+WantedBy=sysinit.target

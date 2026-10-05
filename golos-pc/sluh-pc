@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Слух на ПК: голос собеседника из разговора на BF7 -> whisper.cpp (CUDA).
+
+Включает на телефоне запись собеседника (bf7-rech «zapis»), тянет поток по
+SSH (s16le, 16 кГц, моно), режет на фразы по паузам и распознаёт. Каждая
+фраза — строкой «ЧЧ:ММ:СС СОБЕСЕДНИК: …» в stdout и в dialog.log рядом.
+Выходит, когда разговор на телефоне кончился.
+"""
+import array, collections, math, os, subprocess, sys, time, wave, select
+
+G = os.path.dirname(os.path.abspath(__file__))
+WHISPER = os.path.join(G, "whisper.cpp/build/bin/whisper-cli")
+MODEL = os.path.join(G, "ggml-large-v3-turbo-q5_0.bin")
+RATE = 16000
+KADR = RATE * 30 // 1000
+MIN_RMS = 250.0
+NACHALO, KONEC, MAKS = 5, 23, 15 * 1000 // 30
+
+def vyvod(kto, tekst):
+    s = "%s %s: %s" % (time.strftime("%H:%M:%S"), kto, tekst)
+    print(s, flush=True)
+    with open(os.path.join(G, "dialog.log"), "a", encoding="utf-8") as f:
+        f.write(s + "\n")
+
+# Что whisper «слышит» в шуме и тишине — из субтитров, на которых учился.
+GALLJUCINACII = ("продолжение следует", "субтитры", "редактор субтитров",
+                 "спасибо за просмотр", "подписывайтесь", "до новых встреч на канале",
+                 "динамичная музыка", "музыка", "аплодисменты")
+MIN_FRAZA_S = 0.5
+
+def galljucinacija(t):
+    n = t.lower().strip(" .!?…")
+    return any(n.startswith(g) or n == g for g in GALLJUCINACII)
+
+def rms(k):
+    a = array.array("h", k)
+    return math.sqrt(sum(x * x for x in a) / len(a)) if a else 0.0
+
+def raspoznat(pcm):
+    put = os.path.join(G, "fraza.wav")
+    with wave.open(put, "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(RATE); w.writeframes(pcm)
+    t = time.monotonic()
+    r = subprocess.run([WHISPER, "-m", MODEL, "-l", "ru", "-nt", "-np", "-f", put],
+                       capture_output=True, text=True)
+    tekst = " ".join(r.stdout.split()).strip()
+    print("  (фраза %.1f с, распознана за %.1f с)" % (len(pcm) / 2 / RATE, time.monotonic() - t),
+          file=sys.stderr, flush=True)
+    return tekst
+
+def razgovor_idet():
+    r = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "bf7",
+                        "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline 2>/dev/null | grep -q '^/usr/local/bin/bf7-rech zvonok' && exit 0; done; exit 1"])
+    return r.returncode == 0
+
+def main():
+    if not razgovor_idet():
+        print("разговора нет", file=sys.stderr); return 1
+    ssh = subprocess.Popen(["ssh", "bf7",
+        "rm -f /run/bf7-sobesednik.raw; echo 'zapis /run/bf7-sobesednik.raw' > /run/bf7-rech.cmd; "
+        "for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /run/bf7-sobesednik.raw ] && break; sleep 0.2; done; "
+        "exec tail -c +1 -F /run/bf7-sobesednik.raw"], stdout=subprocess.PIPE)
+    vyvod("СЛУХ", "включён (whisper large-v3-turbo на ПК)")
+    fon = collections.deque(maxlen=166)
+    fraza = bytearray(); rechi = tishiny = 0
+    pred = collections.deque(maxlen=NACHALO + 3)
+    hvost = b""; tiho_s = time.monotonic()
+    try:
+        while True:
+            r, _, _ = select.select([ssh.stdout], [], [], 1.0)
+            if not r:
+                if time.monotonic() - tiho_s > 10:
+                    tiho_s = time.monotonic()
+                    if not razgovor_idet():
+                        break
+                continue
+            d = os.read(ssh.stdout.fileno(), KADR * 2 * 10)
+            if not d:
+                break
+            tiho_s = time.monotonic()
+            d = hvost + d
+            n = len(d) // (KADR * 2) * (KADR * 2)
+            hvost = d[n:]
+            for i in range(0, n, KADR * 2):
+                k = d[i:i + KADR * 2]
+                e = rms(k)
+                fon.append(e)
+                uroven = sorted(fon)[len(fon) // 5] if len(fon) > 20 else MIN_RMS
+                golos = e > max(MIN_RMS, uroven * 3)
+                if not fraza:
+                    pred.append(k)
+                    rechi = rechi + 1 if golos else 0
+                    if rechi >= NACHALO:
+                        fraza = bytearray(b"".join(pred)); tishiny = 0
+                    continue
+                fraza += k
+                tishiny = 0 if golos else tishiny + 1
+                if tishiny >= KONEC or len(fraza) >= MAKS * KADR * 2:
+                    rech_s = len(fraza) / 2 / RATE - tishiny * 0.03
+                    tekst = raspoznat(bytes(fraza)) if rech_s >= MIN_FRAZA_S else ""
+                    if tekst and not tekst.startswith(("[", "(", "*")) and not galljucinacija(tekst):
+                        vyvod("СОБЕСЕДНИК", tekst)
+                    elif tekst:
+                        print("  (отброшено: %s)" % tekst[:80], file=sys.stderr, flush=True)
+                    fraza = bytearray(); rechi = 0; pred.clear()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ssh.kill()
+        subprocess.run(["ssh", "bf7", "echo 'zapis stop' > /run/bf7-rech.cmd"], timeout=15)
+        vyvod("СЛУХ", "выключен")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

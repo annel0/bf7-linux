@@ -1,0 +1,18 @@
+[GNOME Session]
+# BF7: состав телефонного сеанса.
+#
+# Пакетный phosh.session требует восемнадцать служб настроек GNOME. Телефону из
+# них нужны не все: убраны планшеты (Wacom), смарт-карты (Smartcard), принтеры
+# (PrintNotifications), обмен файлами (Sharing), защита USB (UsbProtection — у
+# нас по USB идёт единственный надёжный канал к телефону) и модем (Wwan —
+# модемов в системе нет, ModemManager отключён по той же причине).
+#
+# Каждая из них — отдельный процесс на два десятка мегабайт и своя доля
+# процессора при старте сеанса, а старт сеанса у нас и так упирается в
+# процессор.
+#
+# Файл кладётся в /usr/local/share/gnome-session/sessions/phosh.session:
+# по умолчанию XDG_DATA_DIRS начинается с /usr/local/share, так что пакетный
+# остаётся нетронутым и к нему можно вернуться, убрав этот.
+Name=Phosh
+RequiredComponents=org.gnome.SettingsDaemon.A11ySettings;org.gnome.SettingsDaemon.Color;org.gnome.SettingsDaemon.Datetime;org.gnome.SettingsDaemon.Housekeeping;org.gnome.SettingsDaemon.Keyboard;org.gnome.SettingsDaemon.MediaKeys;org.gnome.SettingsDaemon.Power;org.gnome.SettingsDaemon.Rfkill;org.gnome.SettingsDaemon.ScreensaverProxy;org.gnome.SettingsDaemon.Sound;org.gnome.SettingsDaemon.XSettings;sm.puri.Phosh;sm.puri.OSK0;

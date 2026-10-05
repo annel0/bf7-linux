@@ -1,0 +1,192 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: portfolio 0.9.14\n"
+"Language: ru\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\n"
+"Last-Translator: BF7 (Claude)\n"
+
+msgid "Portfolio"
+msgstr "Файлы"
+
+msgid "File Manager"
+msgstr "Файловый менеджер"
+
+msgid "Manage files on the go"
+msgstr "Файлы на телефоне"
+
+msgid "folder;manager;explore;disk;filesystem;"
+msgstr "папка;файлы;менеджер;диск;проводник;"
+
+msgid "Martin Abente Lahaye"
+msgstr "Martin Abente Lahaye"
+
+msgid "Filter"
+msgstr "Фильтр"
+
+msgid "Show Hidden Files"
+msgstr "Показывать скрытые файлы"
+
+msgid "Sort"
+msgstr "Сортировка"
+
+msgid "A-Z"
+msgstr "А–Я"
+
+msgid "Last Modified"
+msgstr "По дате изменения"
+
+msgid "Help"
+msgstr "Справка"
+
+msgid "About Portfolio"
+msgstr "О программе"
+
+msgid "No files found"
+msgstr "Файлов нет"
+
+msgid "Properties"
+msgstr "Свойства"
+
+msgid "Name"
+msgstr "Имя"
+
+msgid "Location"
+msgstr "Расположение"
+
+msgid "Type"
+msgstr "Тип"
+
+msgid "Size"
+msgstr "Размер"
+
+msgid "Created"
+msgstr "Создан"
+
+msgid "Modified"
+msgstr "Изменён"
+
+msgid "Accessed"
+msgstr "Открыт"
+
+msgid "About"
+msgstr "О программе"
+
+msgid "<a href=\"https://github.com/tchx84/portfolio\">Website</a>"
+msgstr "<a href=\"https://github.com/tchx84/portfolio\">Сайт</a>"
+
+msgid "Created by"
+msgstr "Автор"
+
+msgid "Artwork by"
+msgstr "Оформление"
+
+msgid "Translated by"
+msgstr "Перевод"
+
+msgid "Contributions by"
+msgstr "Участники"
+
+msgid "Trash"
+msgstr "Корзина"
+
+msgid "Places"
+msgstr "Места"
+
+msgid "Devices"
+msgstr "Устройства"
+
+msgid "Home"
+msgstr "Домашняя папка"
+
+msgid "System"
+msgstr "Система"
+
+msgid "Host"
+msgstr "Хост"
+
+msgid "No places found"
+msgstr "Мест нет"
+
+msgid "Opening"
+msgstr "Открываю"
+
+msgid "Could not open %s"
+msgstr "Не удалось открыть %s"
+
+msgid "Loading"
+msgstr "Загружаю"
+
+msgid "Could not load %s"
+msgstr "Не удалось загрузить %s"
+
+msgid "%s already exists"
+msgstr "%s уже существует"
+
+msgid "these %d files"
+msgstr "эти файлы (%d)"
+
+msgid "Delete %s permanently?"
+msgstr "Удалить %s навсегда?"
+
+msgid "%s will be moved"
+msgstr "%s будет перемещён"
+
+msgid "%d files will be moved"
+msgstr "Будет перемещено файлов: %d"
+
+msgid "%s will be copied"
+msgstr "%s будет скопирован"
+
+msgid "%d files will be copied"
+msgstr "Будет скопировано файлов: %d"
+
+msgid "Files will be overwritten, proceed?"
+msgstr "Файлы будут перезаписаны. Продолжить?"
+
+msgid "Pasting"
+msgstr "Вставляю"
+
+msgid "%s of %s"
+msgstr "%s из %s"
+
+msgid "Could not paste %s"
+msgstr "Не удалось вставить %s"
+
+msgid "Deleting"
+msgstr "Удаляю"
+
+msgid "Could not delete %s"
+msgstr "Не удалось удалить %s"
+
+msgid "Stopping"
+msgstr "Останавливаю"
+
+msgid "New Folder"
+msgstr "Новая папка"
+
+msgid "No permissions on this directory"
+msgstr "Нет прав на эту папку"
+
+msgid "Restoring"
+msgstr "Восстанавливаю"
+
+msgid "Could not restore %s"
+msgstr "Не удалось восстановить %s"
+
+msgid "Removing device, please wait"
+msgstr "Отключаю устройство, подождите"
+
+msgid "Device can be removed"
+msgstr "Устройство можно извлечь"
+
+msgid "Device is busy, can't be removed"
+msgstr "Устройство занято, извлечь нельзя"
+
+msgid "Sorry, that didn't work"
+msgstr "Не получилось"
+
+msgid "Calculating..."
+msgstr "Считаю…"

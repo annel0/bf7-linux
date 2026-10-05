@@ -1,0 +1,21 @@
+[Unit]
+Description=Узлы binder для андроидных служб
+Documentation=https://www.kernel.org/doc/html/latest/admin-guide/binderfs.html
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=sysinit.target bf7-android-mounts.service
+ConditionPathExists=/proc/filesystems
+
+[Service]
+# Ядро собрано с CONFIG_ANDROID_BINDERFS, но узлов никто не создаёт.
+# Без /dev/binder libbinder завершает процесс словами
+# "Binder driver could not be opened. Terminating." — на этом падал
+# аппаратный видеодекодер MediaTek.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mkdir -p /dev/binderfs; mountpoint -q /dev/binderfs || mount -t binder binder /dev/binderfs'
+ExecStart=/bin/sh -c 'for d in binder hwbinder vndbinder; do [ -e /dev/binderfs/$d ] && ln -sf /dev/binderfs/$d /dev/$d; done; true'
+ExecStop=/bin/sh -c 'rm -f /dev/binder /dev/hwbinder /dev/vndbinder; umount /dev/binderfs 2>/dev/null || true'
+
+[Install]
+WantedBy=sysinit.target

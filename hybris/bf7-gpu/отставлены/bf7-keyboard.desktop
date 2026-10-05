@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Экранная клавиатура
+Comment=onboard, появляется при фокусе в поле ввода
+Exec=/usr/local/bin/bf7-keyboard-start
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

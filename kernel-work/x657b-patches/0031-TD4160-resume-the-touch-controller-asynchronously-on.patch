@@ -1,0 +1,114 @@
+From 7b71ddb171e8ce1c6c65a00fab434e0a595349b4 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Fri, 25 Sep 2026 13:11:15 +0300
+Subject: [PATCH 31/40] TD4160: resume the touch controller asynchronously on
+ unblank
+
+syna_tcm_resume waited for the controller (and its romboot firmware
+download) inside the fb notifier chain, i.e. in the compositor's thread
+while the panel was being enabled: ~150 of the 380 ms from phoc's
+action to backlight. Queue it on system_unbound_wq; flush before
+blanking so suspend never overtakes a pending resume.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../touchscreen/TD4160/synaptics_tcm_core.c   | 32 ++++++++++++++++---
+ .../touchscreen/TD4160/synaptics_tcm_core.h   |  5 +++
+ 2 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
+index 7c2635a40..3c6803f10 100644
+--- a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
++++ b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.c
+@@ -3120,6 +3120,24 @@ static int syna_tcm_early_suspend(struct device *dev)
+ 	return 0;
+ }
+ 
++/*
++ * BF7: продолжение сенсора — асинхронно.
++ *
++ * syna_tcm_resume ждёт отчёта контроллера и при надобности перезагружает его
++ * прошивку (romboot) — ~150 мс. Вызванная прямо из fb-уведомления, она шла в
++ * потоке композитора внутри включения экрана, и подсветка ждала сенсор:
++ * от действия phoc до подсветки 0,38 с, из них ~0,15 с — сенсор
++ * (2026-09-25). Теперь экран зажигается сразу, сенсор догоняет следом.
++ */
++static void syna_tcm_bf7_resume_fn(struct work_struct *work)
++{
++	struct syna_tcm_hcd *tcm_hcd =
++			container_of(work, struct syna_tcm_hcd, bf7_resume_work);
++
++	syna_tcm_resume(&tcm_hcd->pdev->dev);
++	tcm_hcd->fb_ready++;
++}
++
+ static int syna_tcm_fb_notifier_cb(struct notifier_block *nb,
+ 		unsigned long action, void *data)
+ {
+@@ -3159,16 +3177,19 @@ static int syna_tcm_fb_notifier_cb(struct notifier_block *nb,
+ 	if (evdata && evdata->data && tcm_hcd) {
+ 		transition = evdata->data;
+ 		if (action == FB_EARLY_EVENT_BLANK &&
+-				*transition == FB_BLANK_POWERDOWN)
++				*transition == FB_BLANK_POWERDOWN) {
++			/* пробуждение, если ещё идёт, должно закончиться раньше */
++			flush_work(&tcm_hcd->bf7_resume_work);
+ 			retval = syna_tcm_early_suspend(&tcm_hcd->pdev->dev);
+-		else if (action == FB_EVENT_BLANK) {
++		} else if (action == FB_EVENT_BLANK) {
+ 			if (*transition == FB_BLANK_POWERDOWN) {
++				flush_work(&tcm_hcd->bf7_resume_work);
+ 				retval = syna_tcm_suspend(&tcm_hcd->pdev->dev);
+ 				tcm_hcd->fb_ready = 0;
+ 			} else if (*transition == FB_BLANK_UNBLANK) {
+ #ifndef RESUME_EARLY_UNBLANK
+-				retval = syna_tcm_resume(&tcm_hcd->pdev->dev);
+-				tcm_hcd->fb_ready++;
++				queue_work(system_unbound_wq,
++					   &tcm_hcd->bf7_resume_work);
+ #endif
+ 			}
+ 		} else if (action == FB_EARLY_EVENT_BLANK &&
+@@ -3380,6 +3401,7 @@ static int syna_tcm_probe(struct platform_device *pdev)
+ 	}
+ 
+ #ifdef CONFIG_FB
++	INIT_WORK(&tcm_hcd->bf7_resume_work, syna_tcm_bf7_resume_fn);
+ 	tcm_hcd->fb_notifier.notifier_call = syna_tcm_fb_notifier_cb;
+ 	retval = fb_register_client(&tcm_hcd->fb_notifier);
+ 	if (retval < 0) {
+@@ -3463,6 +3485,7 @@ static int syna_tcm_probe(struct platform_device *pdev)
+ err_create_run_kthread:
+ #ifdef CONFIG_FB
+ 	fb_unregister_client(&tcm_hcd->fb_notifier);
++	cancel_work_sync(&tcm_hcd->bf7_resume_work);
+ #endif
+ 
+ err_sysfs_create_dynamic_config_file:
+@@ -3547,6 +3570,7 @@ static int syna_tcm_remove(struct platform_device *pdev)
+ 
+ #ifdef CONFIG_FB
+ 	fb_unregister_client(&tcm_hcd->fb_notifier);
++	cancel_work_sync(&tcm_hcd->bf7_resume_work);
+ #endif
+ 
+ 	for (idx = 0; idx < ARRAY_SIZE(dynamic_config_attrs); idx++) {
+diff --git a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.h b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.h
+index 838663866..10f1f08c8 100644
+--- a/drivers/input/touchscreen/TD4160/synaptics_tcm_core.h
++++ b/drivers/input/touchscreen/TD4160/synaptics_tcm_core.h
+@@ -380,6 +380,11 @@ struct syna_tcm_features {
+ } __packed;
+ 
+ struct syna_tcm_hcd {
++	/*
++	 * BF7: продолжение сенсора при включении экрана — в рабочей очереди,
++	 * а не в цепочке fb-уведомлений (см. syna_tcm_fb_notifier_cb).
++	 */
++	struct work_struct bf7_resume_work;
+ 	pid_t isr_pid;
+ 	atomic_t command_status;
+ 	atomic_t host_downloading;
+-- 
+2.55.0
+

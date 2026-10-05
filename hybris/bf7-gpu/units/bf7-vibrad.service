@@ -1,0 +1,19 @@
+[Unit]
+# BF7: мост от вибромотора к подсистеме обратной связи.
+# Без него feedbackd пишет «No vibra capable device found»: мотор у нас выведен
+# светодиодом, а ему нужно устройство ввода с обратной связью.
+Description=Вибромотор BF7 как устройство обратной связи
+# Before= — чтобы feedbackd из сеанса нашёл мотор при старте. After=
+# multi-user.target здесь стоял зря и дорого: вместе с Before= он заставлял
+# телефонный сеанс ждать ВСЕХ служб (звук, Wi-Fi…), и экран появлялся на
+# 10–17 с позже. Мотор — встроенный драйвер ядра, он готов с 2-й секунды.
+Before=bf7-phosh.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bf7-vibrad
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

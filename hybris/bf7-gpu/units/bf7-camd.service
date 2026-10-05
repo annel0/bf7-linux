@@ -1,0 +1,36 @@
+[Unit]
+# Камера поднимается ПОСЛЕ сеанса. Замер загрузки: bf7-camd ждал приёмник
+# тринадцать секунд, и всё это время multi-user.target, а за ней и графика,
+# стояли. Экрану телефона незачем ждать камеру — она догонит.
+#
+# Порядок берём от самой оболочки, а не от graphical.target: «After=цель» при
+# «WantedBy=цель» — это кольцо, systemd молча выкинет задание.
+# Кадры из блока захвата CAMSV в /dev/video0.
+#
+# Обычная программа glibc: собирается прямо на телефоне
+#     gcc -O2 -o bf7-camd bf7-camd.c -lm
+# Разбирает мозаику Байера, ведёт выдержку, баланс белого и наводку.
+#
+# Пока камеру никто не открыл, демон спит и не занимает ядро: разбор кадра
+# стоит 28 мс при кадре в 30 мс, то есть почти целый процессор.
+Description=Камера: кадры в /dev/video0
+After=bf7-camera.service bf7-phosh.service
+Requires=bf7-camera.service
+
+# Перед сном — остановить вместе с bf7-camera (см. там), после — крюк bf7-posle-sna.
+Conflicts=sleep.target
+Before=sleep.target
+[Service]
+Type=simple
+WorkingDirectory=/root/camera
+ExecStart=/root/camera/bf7-camd
+# Приёмник встаёт на пару секунд позже; демон в этом случае выходит с ошибкой
+# и его надо просто повторить.
+Restart=always
+RestartSec=2
+Nice=-5
+StandardOutput=append:/tmp/camera.log
+StandardError=append:/tmp/camera.log
+
+[Install]
+WantedBy=graphical.target

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Веб-браузер
+Name[en]=Web
+Comment=GNOME Web через наш слой EGL
+Exec=/usr/local/bin/bf7-web %U
+Icon=org.gnome.Epiphany
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

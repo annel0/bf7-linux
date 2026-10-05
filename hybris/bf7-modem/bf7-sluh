@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""BF7: «слух» — распознавание речи собеседника в идущем разговоре.
+
+Включает запись собеседника (bf7-rech «zapis», через канал команд
+bf7-zvonki), режет поток на фразы по паузам и отдаёт каждую whisper.cpp.
+Распознанный текст — строкой «ЧЧ:ММ:СС СОБЕСЕДНИК: …» в /run/bf7-dialog.log.
+Отвечать — bf7-skazat «текст» (голос уходит в разговор).
+
+Поток: s16le, 16 кГц, моно (вход HAL TELEPHONY_RX / VOICE_DOWNLINK).
+Фраза: энергия кадра 30 мс выше порога ≥ 150 мс; конец — 700 мс тишины
+или 15 с речи. Порог подстраивается: уровень фона — нижняя пятая часть
+энергий за последние ~5 с, речь — втрое громче фона (но не тише MIN_RMS).
+
+Распознаёт Parakeet TDT 0.6B v3 (int8, sherpa-onnx) из /opt/bf7-golos —
+1,1× реального времени на Cortex-A53, против 0,17× у whisper base (замер
+2026-09-30). Загрузка ~24 с: запись к этому времени уже идёт в файл, и
+Parakeet успевает догнать отставание. Нет Parakeet или sherpa-onnx — whisper.
+
+Вызов: bf7-sluh [--whisper] [--model ПУТЬ]   (останавливать — SIGTERM/Ctrl-C;
+                                  сам выходит, когда разговор кончился)
+       bf7-sluh --proba ФАЙЛ.wav  — распознать файл без звонка и выйти
+"""
+import array
+import collections
+import math
+import os
+import subprocess
+import sys
+import time
+import wave
+
+KANAL = "/run/bf7-rech.cmd"
+POTOK = "/run/bf7-sobesednik.raw"
+DIALOG = "/run/bf7-dialog.log"
+WHISPER = "/root/src/whisper.cpp/build/bin/whisper-cli"
+MODEL = "/opt/bf7-golos/ggml-base-q5_1.bin"
+PARAKEET = "/opt/bf7-golos/parakeet-tdt-0.6b-v3-int8"
+# sherpa-onnx стоит в своём окружении: pip в системный Python Debian не пускает
+VENV_SITE = "/opt/bf7-golos/venv/lib/python%d.%d/site-packages" % sys.version_info[:2]
+
+RATE = 16000
+KADR = RATE * 30 // 1000          # 30 мс
+MIN_RMS = 250.0
+NACHALO = 5                       # кадров речи подряд (150 мс)
+KONEC = 23                        # кадров тишины (≈700 мс)
+MAKS = 15 * 1000 // 30            # 15 с
+
+
+def log(s):
+    print("bf7-sluh: " + s, file=sys.stderr, flush=True)
+
+
+def zapisat_dialog(kto, tekst):
+    with open(DIALOG, "a", encoding="utf-8") as f:
+        f.write("%s %s: %s\n" % (time.strftime("%H:%M:%S"), kto, tekst))
+
+
+def komanda(s):
+    with open(KANAL, "w") as f:
+        f.write(s + "\n")
+
+
+def rms(kadr):
+    a = array.array("h", kadr)
+    return math.sqrt(sum(x * x for x in a) / len(a)) if a else 0.0
+
+
+def zagruzit_parakeet():
+    """Распознаватель Parakeet или None (тогда работает whisper)."""
+    if not os.path.isdir(PARAKEET):
+        return None
+    try:
+        import sherpa_onnx
+    except ImportError:
+        sys.path.insert(0, VENV_SITE)
+        try:
+            import sherpa_onnx
+        except ImportError:
+            log("нет sherpa-onnx (%s) — распознаю whisper" % VENV_SITE)
+            return None
+    t = time.monotonic()
+    rec = sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=PARAKEET + "/encoder.int8.onnx", decoder=PARAKEET + "/decoder.int8.onnx",
+        joiner=PARAKEET + "/joiner.int8.onnx", tokens=PARAKEET + "/tokens.txt",
+        num_threads=4, model_type="nemo_transducer", decoding_method="greedy_search")
+    log("Parakeet загружен за %.1f с" % (time.monotonic() - t))
+    return rec
+
+
+def raspoznat_parakeet(pcm, rec):
+    import numpy as np
+    t = time.monotonic()
+    s = rec.create_stream()
+    s.accept_waveform(RATE, np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768)
+    rec.decode_stream(s)
+    tekst = s.result.text.strip()
+    log("фраза %.1f с распознана за %.1f с: %s" %
+        (len(pcm) / 2 / RATE, time.monotonic() - t, tekst or "(пусто)"))
+    return tekst
+
+
+def raspoznat(pcm, model, rec=None):
+    if rec is not None:
+        return raspoznat_parakeet(pcm, rec)
+    put = "/run/bf7-fraza.wav"
+    with wave.open(put, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(pcm)
+    t = time.monotonic()
+    r = subprocess.run([WHISPER, "-m", model, "-l", "ru", "-t", "4", "-nt",
+                        "-np", "-f", put], capture_output=True, text=True)
+    tekst = " ".join(r.stdout.split()).strip()
+    log("фраза %.1f с распознана за %.1f с: %s" %
+        (len(pcm) / 2 / RATE, time.monotonic() - t, tekst or "(пусто)"))
+    return tekst
+
+
+def razgovor_idet():
+    # bf7-rech в режиме разговора — значит, звонок идёт
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                with open("/proc/%s/cmdline" % p, "rb") as f:
+                    if b"bf7-rech\0zvonok" in f.read():
+                        return True
+            except OSError:
+                pass
+    return False
+
+
+def proba(put):
+    """--proba ФАЙЛ.wav: распознать файл (16 кГц, моно, 16 бит) без звонка."""
+    with wave.open(put) as w:
+        if (w.getframerate(), w.getnchannels(), w.getsampwidth()) != (RATE, 1, 2):
+            log("нужен wav 16 кГц, моно, 16 бит")
+            return 1
+        pcm = w.readframes(w.getnframes())
+    rec = None if "--whisper" in sys.argv else zagruzit_parakeet()
+    print(raspoznat(pcm, MODEL, rec))
+    return 0
+
+
+def main():
+    model = MODEL
+    if len(sys.argv) > 2 and sys.argv[1] == "--proba":
+        return proba(sys.argv[2])
+    if "--model" in sys.argv:
+        model = sys.argv[sys.argv.index("--model") + 1]
+    if not os.path.exists(KANAL):
+        log("нет %s — bf7-zvonki не запущен (разговора нет)" % KANAL)
+        return 1
+    try:
+        os.unlink(POTOK)
+    except FileNotFoundError:
+        pass
+    komanda("zapis " + POTOK)
+    zapisat_dialog("СЛУХ", "включён")
+    # запись уже идёт в файл — загрузка модели ничего не теряет
+    rec = None if "--whisper" in sys.argv else zagruzit_parakeet()
+    log("слушаю собеседника, распознаёт %s" %
+        ("Parakeet" if rec is not None else os.path.basename(model)))
+
+    for _ in range(50):
+        if os.path.exists(POTOK):
+            break
+        time.sleep(0.1)
+    f = open(POTOK, "rb")
+    fon = collections.deque(maxlen=166)     # ~5 с энергий
+    fraza = bytearray()
+    rechi = tishiny = 0
+    predchuvstvie = collections.deque(maxlen=NACHALO + 3)
+    hvost = b""
+    posl_proverka = time.monotonic()
+    try:
+        while True:
+            d = f.read(KADR * 2 * 10)
+            if not d:
+                if time.monotonic() - posl_proverka > 2:
+                    posl_proverka = time.monotonic()
+                    if not razgovor_idet():
+                        break
+                time.sleep(0.05)
+                continue
+            d = hvost + d
+            n = len(d) // (KADR * 2) * (KADR * 2)
+            hvost = d[n:]
+            for i in range(0, n, KADR * 2):
+                k = d[i:i + KADR * 2]
+                e = rms(k)
+                fon.append(e)
+                uroven = sorted(fon)[len(fon) // 5] if len(fon) > 20 else MIN_RMS
+                golos = e > max(MIN_RMS, uroven * 3)
+                if not fraza:
+                    predchuvstvie.append(k)
+                    rechi = rechi + 1 if golos else 0
+                    if rechi >= NACHALO:
+                        fraza = bytearray(b"".join(predchuvstvie))
+                        tishiny = 0
+                    continue
+                fraza += k
+                tishiny = 0 if golos else tishiny + 1
+                if tishiny >= KONEC or len(fraza) >= MAKS * KADR * 2:
+                    tekst = raspoznat(bytes(fraza), model, rec)
+                    if tekst and not tekst.startswith("["):
+                        zapisat_dialog("СОБЕСЕДНИК", tekst)
+                    fraza = bytearray()
+                    rechi = 0
+                    predchuvstvie.clear()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            komanda("zapis stop")
+        except OSError:
+            pass
+        zapisat_dialog("СЛУХ", "выключен")
+        log("выключен")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

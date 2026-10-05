@@ -1,0 +1,17 @@
+[Unit]
+# BF7: HAL NVRAM MediaTek. fsd в ccci_mdinit читает NVRAM модема через него
+# по hwbinder; без него модем на первом запросе файла ждёт вечно и не
+# проходит второе рукопожатие. Подпорки — те же, что у gralloc в
+# bf7-android-hal (hal-start.sh).
+Description=HAL NVRAM MediaTek (для модема)
+After=bf7-android-hal.service bf7-modem-mounts.service
+Requires=bf7-android-hal.service bf7-modem-mounts.service
+
+[Service]
+Environment=LD_PRELOAD=/vendor.local/lib64/libbf7prop.so:/vendor.local/lib64/libbf7log.so:/vendor.local/lib64/libselinux-stub.so
+ExecStart=/vendor/bin/hw/vendor.mediatek.hardware.nvram@1.1-service
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

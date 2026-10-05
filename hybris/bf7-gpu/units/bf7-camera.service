@@ -1,0 +1,44 @@
+[Unit]
+# Камера поднимается ПОСЛЕ сеанса. Замер загрузки: bf7-camd ждал приёмник
+# тринадцать секунд, и всё это время multi-user.target, а за ней и графика,
+# стояли. Экрану телефона незачем ждать камеру — она догонит.
+#
+# Порядок берём от самой оболочки, а не от graphical.target: «After=цель» при
+# «WantedBy=цель» — это кольцо, systemd молча выкинет задание.
+# Подъём камеры: приёмник MIPI и поток с матрицы.
+#
+# Приёмник (seninf) у MediaTek настраивает не ядро, а вендорская
+# libcam.halsensor.so, собранная под bionic. Поэтому эта часть — андроидный
+# бинарник, как bf7-videod. Выходить ему нельзя: закрытие /dev/kd_camera_hw
+# гасит такты и сбрасывает ножки, то есть выключает камеру.
+#
+# Сам узел /dev/video0 делает v4l2loopback, а кадры в него кладёт bf7-camd.
+Description=Камера: приёмник MIPI и поток с матрицы
+After=bf7-android-mounts.service bf7-binderfs.service bf7-phosh.service
+Requires=bf7-android-mounts.service
+
+# Перед сном — остановить (Conflicts=sleep.target), после — поднимает крюк
+# bf7-posle-sna. Держать камеру через сон нельзя: драйвер ISP во сне сам гасит
+# такты, а при закрытии узла после пробуждения гасит их второй раз
+# («cam_larb2 already disabled»). Шина SMI у камеры общая с дисплеем: очередь
+# команд дисплея вставала (CMDQ ждёт WDMA0), и любая перезагрузка после сна
+# висела до сторожа — 94 с вместо 30 (2026-09-25, 3 из 3). Заодно матрица и
+# её питание во сне выключены.
+Conflicts=sleep.target
+Before=sleep.target
+[Service]
+Type=simple
+WorkingDirectory=/root/camera
+# Модуль грузится штатным путём, через modules-load.d; здесь только страховка
+# на случай, если он почему-то не поднялся.
+ExecStartPre=-/sbin/modprobe v4l2loopback
+Environment=LD_LIBRARY_PATH=/apex/com.android.vndk.v31/lib64:/vendor/lib64:/vendor/lib64/hw:/system/lib64:/system/lib64/hw
+Environment="LD_PRELOAD=/vendor.local/lib64/libselinux-stub.so /vendor.local/lib64/libbf7prop.so /vendor.local/lib64/libbf7log.so /vendor.local/lib64/libbf7binder.so"
+ExecStart=/root/camera/bf7-seninf-up
+Restart=always
+RestartSec=3
+StandardOutput=append:/tmp/camera.log
+StandardError=append:/tmp/camera.log
+
+[Install]
+WantedBy=graphical.target

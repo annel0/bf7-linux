@@ -1,0 +1,514 @@
+From e6d2a5b443f302696d74c4ea8d03b34e87b834ef Mon Sep 17 00:00:00 2001
+From: bf7 <bf7@local>
+Date: Wed, 16 Sep 2026 16:52:54 +0300
+Subject: [PATCH 05/40] =?UTF-8?q?bf7:=20=D0=BC=D0=B8=D0=BD=D0=B8=D0=BC?=
+ =?UTF-8?q?=D0=B0=D0=BB=D1=8C=D0=BD=D1=8B=D0=B9=20DRM/KMS=20=D0=BF=D0=BE?=
+ =?UTF-8?q?=D0=B2=D0=B5=D1=80=D1=85=20=D0=B2=D0=B5=D0=BD=D0=B4=D0=BE=D1=80?=
+ =?UTF-8?q?=D1=81=D0=BA=D0=BE=D0=B3=D0=BE=20=D1=82=D1=80=D0=B0=D0=BA=D1=82?=
+ =?UTF-8?q?=D0=B0=20=D0=B4=D0=B8=D1=81=D0=BF=D0=BB=D0=B5=D1=8F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Узел DRM от PowerVR (pvrsrvkm) привязан к блоку GPU и не имеет ни одного
+соединителя — это узел для рендера. Вывод изображения живёт отдельно, в
+mtkfb и /dev/mtk_disp_mgr. Из-за отсутствия KMS нет ни GBM, ни glamor в
+Xwayland, ни OpenGL у приложений X, ни стандартного linux-dmabuf.
+
+Полный порт drivers/gpu/drm/mediatek не годится: mt6761 там нет, наш device
+tree описывает дисплей по старой схеме, у узлов нет clocks, узла панели нет
+вовсе. Вместо этого — один CRTC, один соединитель, один primary plane, а
+кадр отдаётся уже работающему вендорскому коду, как это делает udl.
+
+Основа — tinydrm: он рассчитан ровно на случай «одна несъёмная панель, один
+конвейер, буферы CMA».
+
+Тонкость, ради которой всё и писалось аккуратно: src_phy_addr в
+disp_input_config — это не физический адрес, а MVA блока M4U. mtkfb работает
+потому, что один раз при пробе прогоняет свой регион через m4u_alloc_mva()
+с запросом MVA == PA. Поэтому здесь заводится собственный буфер вывода,
+отображается так же один раз, а кадр в него копируется.
+
+Файл лежит рядом с вендорским кодом: primary_display_* не помечены
+EXPORT_SYMBOL, а CONFIG_MTK_FB — bool, значит звать их можно только из
+того же образа.
+---
+ drivers/misc/mediatek/video/Kconfig           |  12 +
+ .../mediatek/video/mt6765/videox/Makefile     |   9 +
+ .../mediatek/video/mt6765/videox/bf7_drm.c    | 427 ++++++++++++++++++
+ 3 files changed, 448 insertions(+)
+ create mode 100644 drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+
+diff --git a/drivers/misc/mediatek/video/Kconfig b/drivers/misc/mediatek/video/Kconfig
+index e6fe79bec..837c02a29 100644
+--- a/drivers/misc/mediatek/video/Kconfig
++++ b/drivers/misc/mediatek/video/Kconfig
+@@ -183,3 +183,15 @@ config MTK_MT6382_CMD_MODE
+ 	  BridgeIC 6382 can support VESA-1.2 DSC, compressing display framedata
+ 	  Normal project will disable it first
+ 	  If you are not sure about this, do not set it to y
++
++config DRM_BF7_DISP
++	bool "BF7: minimal DRM/KMS on top of MediaTek primary_display"
++	depends on MTK_FB && DRM && DRM_TINYDRM
++	help
++	  Экспортирует панель как устройство DRM/KMS с одним CRTC, одним
++	  соединителем и одним primary plane. Регистры не трогает: кадр
++	  отдаётся уже работающему вендорскому тракту primary_display.
++
++	  Нужно для GBM, glamor в Xwayland и OpenGL у приложений X, которых
++	  без KMS не бывает.
++
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/Makefile b/drivers/misc/mediatek/video/mt6765/videox/Makefile
+index e31023aa4..23bce2f3e 100644
+--- a/drivers/misc/mediatek/video/mt6765/videox/Makefile
++++ b/drivers/misc/mediatek/video/mt6765/videox/Makefile
+@@ -116,3 +116,12 @@ ifeq ($(MTK_MIRAVISION_SUPPORT), yes)
+ endif
+ 
+ ccflags-$(CONFIG_MTK_LCM_DEVICE_TREE_SUPPORT) += -DMTK_LCM_DEVICE_TREE_SUPPORT
++
++# BF7: минимальный драйвер DRM/KMS поверх вендорского тракта дисплея.
++# Собирается только вместе с вендорским видеокодом: функции primary_display_*
++# не помечены EXPORT_SYMBOL, поэтому звать их можно лишь из того же образа.
++# primary_display.h тянет mt-plat/mtk_smi.h; в полной сборке этот путь
++# приходит откуда-то сверху, но при сборке одного объекта его нет.
++ccflags-$(CONFIG_DRM_BF7_DISP) += -I$(srctree)/drivers/misc/mediatek/include/mt-plat
++
++obj-$(CONFIG_DRM_BF7_DISP) += bf7_drm.o
+diff --git a/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+new file mode 100644
+index 000000000..619f64d55
+--- /dev/null
++++ b/drivers/misc/mediatek/video/mt6765/videox/bf7_drm.c
+@@ -0,0 +1,427 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * BF7: минимальный драйвер DRM/KMS поверх вендорского тракта дисплея.
++ *
++ * Зачем он нужен. У PowerVR есть узел DRM (pvrsrvkm), но он привязан к блоку
++ * GPU и не имеет ни одного соединителя — это узел для рендера. Вывод
++ * изображения живёт отдельно, во вендорском fbdev-драйвере (mtkfb) и
++ * /dev/mtk_disp_mgr. Из-за отсутствия KMS у нас нет GBM, нет glamor в
++ * Xwayland, нет OpenGL у приложений X и нет стандартного linux-dmabuf.
++ *
++ * Почему не полный порт drivers/gpu/drm/mediatek. Там нет ни mt6761, ни
++ * родственных ему; наш device tree описывает дисплей по старой схеме
++ * (mediatek,disp_ovl0 и подобные), у узлов нет свойств clocks, а узла панели
++ * нет вовсе — имя LCM приходит строкой из тега загрузчика. Это переписывание
++ * фрагмента DT с нуля плюс новые driver_data с выверенными офсетами регистров
++ * плюс драйвер панели.
++ *
++ * Что делает этот драйвер. Один CRTC, один соединитель без обнаружения
++ * (панель несъёмная), один primary plane. Регистры он не трогает: кадр
++ * отдаётся уже работающему вендорскому коду. Образец такой архитектуры в
++ * ядре — drivers/gpu/drm/udl, где вывод тоже уходит во внешний тракт.
++ *
++ * Почему файл лежит здесь, а не в drivers/gpu/drm. Функции primary_display_*
++ * не помечены EXPORT_SYMBOL, а CONFIG_MTK_FB — bool, не tristate: весь
++ * вендорский видеокод линкуется прямо в ядро. Соседство избавляет и от
++ * возни с путями к заголовкам.
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/dma-mapping.h>
++
++#include <drm/drmP.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_fb_cma_helper.h>
++#include <drm/drm_gem_cma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
++#include <drm/drm_modes.h>
++#include <drm/drm_simple_kms_helper.h>
++#include <drm/tinydrm/tinydrm.h>
++#include <drm/tinydrm/tinydrm-helpers.h>
++
++#include "primary_display.h"
++#include "disp_session.h"
++#include "disp_drv_platform.h"
++#include "m4u.h"
++
++struct bf7_drm_device {
++	struct tinydrm_device tinydrm;
++	struct drm_display_mode mode;
++	bool enabled;
++
++	/*
++	 * Собственный буфер вывода.
++	 *
++	 * Отдавать вендорскому тракту буфер клиента напрямую нельзя: поле
++	 * src_phy_addr — это не физический адрес, а MVA, адрес в блоке M4U.
++	 * mtkfb работает потому, что один раз при пробе прогоняет весь свой
++	 * регион через m4u_alloc_mva() с запросом MVA == PA. Повторять это для
++	 * каждого буфера клиента — лишние сложности с временем жизни
++	 * отображения, поэтому заводим один буфер, отображаем его один раз, а
++	 * кадр в него копируем.
++	 */
++	void *scanout_va;
++	dma_addr_t scanout_pa;
++	unsigned int scanout_mva;
++	size_t scanout_size;
++	unsigned int pitch_px;
++	struct m4u_client_t *m4u_client;
++	struct sg_table sgt;
++};
++
++static inline struct bf7_drm_device *bf7_from_tinydrm(struct tinydrm_device *t)
++{
++	return container_of(t, struct bf7_drm_device, tinydrm);
++}
++
++/*
++ * Отправка кадра в панель.
++ *
++ * Повторяет то, что делает mtkfb_pan_display_impl(): заполняет один слой и
++ * зовёт настройку, а затем запуск. primary_display_config_input_multiple()
++ * только настраивает, показ делает primary_display_trigger().
++ *
++ * Слой берём тот же, что и mtkfb (FB_LAYER, он же 0): консоль на нём всё
++ * равно отключена, а чужие слои трогать незачем.
++ */
++static int bf7_post_frame(struct bf7_drm_device *bf7)
++{
++	struct disp_session_input_config *cfg;
++	struct disp_input_config *in;
++	int ret;
++
++	/*
++	 * Структура большая, а обнулить её нужно целиком: ненулевой
++	 * dirty_roi_addr вендорский код воспримет как указатель из userspace.
++	 */
++	cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
++	if (!cfg)
++		return -ENOMEM;
++
++	cfg->setter = SESSION_USER_PANDISP;
++	cfg->config_layer_num = 1;
++
++	in = &cfg->config[0];
++	in->layer_id = primary_display_get_option("FB_LAYER");
++	in->layer_enable = 1;
++	in->buffer_source = DISP_BUFFER_MVA;	/* адрес уже готов */
++	in->src_phy_addr = (void *)(unsigned long)bf7->scanout_mva;
++	in->src_fmt = DISP_FORMAT_BGRA8888;	/* синий в младшем байте, как XRGB8888 у DRM */
++	in->src_offset_x = 0;
++	in->src_offset_y = 0;
++	in->src_width = bf7->mode.hdisplay;
++	in->src_height = bf7->mode.vdisplay;
++	in->src_pitch = bf7->pitch_px;		/* в ПИКСЕЛЯХ, не в байтах */
++	in->tgt_offset_x = 0;
++	in->tgt_offset_y = 0;
++	in->tgt_width = bf7->mode.hdisplay;
++	in->tgt_height = bf7->mode.vdisplay;
++	in->alpha_enable = 0;
++	in->alpha = 0xff;
++	in->next_buff_idx = -1;
++	in->ext_sel_layer = -1;
++
++	ret = primary_display_config_input_multiple(cfg);
++	if (ret) {
++		DRM_ERROR("bf7: настройка слоя отказала: %d\n", ret);
++		goto out;
++	}
++
++	ret = primary_display_trigger(1 /* блокирующий */, NULL, 0);
++	if (ret)
++		DRM_ERROR("bf7: запуск кадра отказал: %d\n", ret);
++out:
++	kfree(cfg);
++	return ret;
++}
++
++/*
++ * Один буфер вывода на всю жизнь драйвера: выделяем и отображаем в M4U так
++ * же, как disp_hal_allocate_framebuffer() делает это для fb-региона —
++ * запрашивая MVA, равный физическому адресу.
++ */
++static int bf7_alloc_scanout(struct device *dev, struct bf7_drm_device *bf7)
++{
++	unsigned int mva;
++	int ret;
++
++	/* Выравнивание строки такое же, как у вендорского кода. */
++	bf7->pitch_px = ALIGN_TO(bf7->mode.hdisplay, MTK_FB_ALIGNMENT);
++	bf7->scanout_size = (size_t)bf7->pitch_px * bf7->mode.vdisplay * 4;
++
++	bf7->scanout_va = dma_alloc_wc(dev, bf7->scanout_size,
++				       &bf7->scanout_pa, GFP_KERNEL);
++	if (!bf7->scanout_va)
++		return -ENOMEM;
++
++	memset(bf7->scanout_va, 0, bf7->scanout_size);
++
++	if (!disp_helper_get_option(DISP_OPT_USE_M4U)) {
++		/* M4U выключен — адрес и есть адрес. */
++		bf7->scanout_mva = (unsigned int)bf7->scanout_pa;
++		return 0;
++	}
++
++	ret = sg_alloc_table(&bf7->sgt, 1, GFP_KERNEL);
++	if (ret)
++		goto err_free;
++
++	sg_dma_address(bf7->sgt.sgl) = bf7->scanout_pa;
++	sg_dma_len(bf7->sgt.sgl) = bf7->scanout_size;
++
++	bf7->m4u_client = m4u_create_client();
++	if (IS_ERR_OR_NULL(bf7->m4u_client)) {
++		ret = -ENODEV;
++		goto err_sgt;
++	}
++
++	mva = (unsigned int)(bf7->scanout_pa & 0xffffffffULL);
++	ret = m4u_alloc_mva(bf7->m4u_client, M4U_PORT_DISP_OVL0, 0,
++			    &bf7->sgt, bf7->scanout_size,
++			    M4U_PROT_READ | M4U_PROT_WRITE, 0, &mva);
++	if (ret)
++		goto err_client;
++
++	bf7->scanout_mva = mva;
++	dev_info(dev, "буфер вывода: %zu байт, PA 0x%pa, MVA 0x%x\n",
++		 bf7->scanout_size, &bf7->scanout_pa, bf7->scanout_mva);
++	return 0;
++
++err_client:
++	m4u_destroy_client(bf7->m4u_client);
++	bf7->m4u_client = NULL;
++err_sgt:
++	sg_free_table(&bf7->sgt);
++err_free:
++	dma_free_wc(dev, bf7->scanout_size, bf7->scanout_va, bf7->scanout_pa);
++	bf7->scanout_va = NULL;
++	return ret;
++}
++
++static int bf7_fb_dirty(struct drm_framebuffer *fb,
++			struct drm_file *file_priv, unsigned int flags,
++			unsigned int color, struct drm_clip_rect *clips,
++			unsigned int num_clips)
++{
++	struct tinydrm_device *tdev = fb->dev->dev_private;
++	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
++	struct drm_gem_cma_object *cma_obj;
++	int ret;
++
++	mutex_lock(&tdev->dirty_lock);
++
++	if (!bf7->enabled) {
++		/* Панель выключена: кадр показывать некому, но это не ошибка. */
++		ret = 0;
++		goto out;
++	}
++
++	cma_obj = drm_fb_cma_get_gem_obj(fb, 0);
++	if (!cma_obj || !cma_obj->vaddr) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/*
++	 * Частичное обновление не делаем: вендорский тракт показывает слой
++	 * целиком. Копируем построчно — шаг строки у клиента и у нас разный.
++	 */
++	{
++		unsigned int y;
++		unsigned int h = min_t(unsigned int, fb->height,
++				       bf7->mode.vdisplay);
++		unsigned int bytes = min_t(unsigned int, fb->pitches[0],
++					   bf7->pitch_px * 4);
++
++		for (y = 0; y < h; y++)
++			memcpy((u8 *)bf7->scanout_va + (size_t)y * bf7->pitch_px * 4,
++			       (u8 *)cma_obj->vaddr + (size_t)y * fb->pitches[0],
++			       bytes);
++	}
++
++	ret = bf7_post_frame(bf7);
++out:
++	mutex_unlock(&tdev->dirty_lock);
++	return ret;
++}
++
++static const struct drm_framebuffer_funcs bf7_fb_funcs = {
++	.destroy	= drm_gem_fb_destroy,
++	.create_handle	= drm_gem_fb_create_handle,
++	.dirty		= tinydrm_fb_dirty,
++};
++
++static void bf7_pipe_enable(struct drm_simple_display_pipe *pipe,
++			    struct drm_crtc_state *crtc_state,
++			    struct drm_plane_state *plane_state)
++{
++	struct tinydrm_device *tdev = pipe_to_tinydrm(pipe);
++	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
++
++	DRM_DEBUG_KMS("bf7: включение конвейера\n");
++	bf7->enabled = true;
++}
++
++static void bf7_pipe_disable(struct drm_simple_display_pipe *pipe)
++{
++	struct tinydrm_device *tdev = pipe_to_tinydrm(pipe);
++	struct bf7_drm_device *bf7 = bf7_from_tinydrm(tdev);
++
++	DRM_DEBUG_KMS("bf7: выключение конвейера\n");
++	bf7->enabled = false;
++}
++
++static const struct drm_simple_display_pipe_funcs bf7_pipe_funcs = {
++	.enable		= bf7_pipe_enable,
++	.disable	= bf7_pipe_disable,
++	.update		= tinydrm_display_pipe_update,
++	.prepare_fb	= drm_gem_fb_simple_display_pipe_prepare_fb,
++};
++
++static const uint32_t bf7_formats[] = {
++	DRM_FORMAT_XRGB8888,
++	DRM_FORMAT_ARGB8888,
++};
++
++DEFINE_DRM_GEM_CMA_FOPS(bf7_fops);
++
++static struct drm_driver bf7_drm_driver = {
++	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_PRIME |
++				  DRIVER_ATOMIC,
++	.fops			= &bf7_fops,
++	TINYDRM_GEM_DRIVER_OPS,
++	.name			= "bf7disp",
++	.desc			= "BF7 display over MediaTek primary_display",
++	.date			= "20260916",
++	.major			= 1,
++	.minor			= 0,
++};
++
++static int bf7_drm_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct bf7_drm_device *bf7;
++	struct tinydrm_device *tdev;
++	unsigned int w, h;
++	int ret;
++
++	/* Буферы CMA адресуются 32 битами — этого дисплею достаточно. */
++	ret = dma_coerce_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return ret;
++
++	bf7 = devm_kzalloc(dev, sizeof(*bf7), GFP_KERNEL);
++	if (!bf7)
++		return -ENOMEM;
++
++	/*
++	 * primary_display_init() зовёт mtkfb и только он — функция не
++	 * идемпотентна. Ждём, пока он поднимет дисплей.
++	 */
++	if (!primary_display_is_alive()) {
++		dev_info(dev, "дисплей ещё не поднят, откладываю\n");
++		return -EPROBE_DEFER;
++	}
++
++	w = primary_display_get_width();
++	h = primary_display_get_height();
++	if (!w || !h) {
++		dev_info(dev, "нулевые размеры панели (%ux%u)\n", w, h);
++		return -ENODEV;
++	}
++
++	/*
++	 * Физический размер панели вендорский код не сообщает. Подставляем
++	 * правдоподобные миллиметры: без них DPI посчитается неверно и шрифты
++	 * будут не того размера.
++	 */
++	bf7->mode = (struct drm_display_mode) {
++		TINYDRM_MODE(0, 0, 62, 139),
++	};
++	bf7->mode.hdisplay = bf7->mode.hsync_start = bf7->mode.hsync_end =
++		bf7->mode.htotal = w;
++	bf7->mode.vdisplay = bf7->mode.vsync_start = bf7->mode.vsync_end =
++		bf7->mode.vtotal = h;
++
++	ret = bf7_alloc_scanout(dev, bf7);
++	if (ret)
++		return ret;
++
++	tdev = &bf7->tinydrm;
++	ret = devm_tinydrm_init(dev, tdev, &bf7_fb_funcs, &bf7_drm_driver);
++	if (ret)
++		return ret;
++
++	tdev->fb_dirty = bf7_fb_dirty;
++
++	ret = tinydrm_display_pipe_init(tdev, &bf7_pipe_funcs,
++					DRM_MODE_CONNECTOR_DSI,
++					bf7_formats, ARRAY_SIZE(bf7_formats),
++					&bf7->mode, 0);
++	if (ret)
++		return ret;
++
++	drm_mode_config_reset(tdev->drm);
++	platform_set_drvdata(pdev, tdev);
++
++	ret = devm_tinydrm_register(tdev);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "KMS поверх вендорского тракта: %ux%u\n", w, h);
++	return 0;
++}
++
++static int bf7_drm_remove(struct platform_device *pdev)
++{
++	struct tinydrm_device *tdev = platform_get_drvdata(pdev);
++
++	tinydrm_shutdown(tdev);
++	return 0;
++}
++
++static struct platform_driver bf7_drm_platform_driver = {
++	.driver = {
++		.name = "bf7-disp",
++	},
++	.probe = bf7_drm_probe,
++	.remove = bf7_drm_remove,
++};
++
++static struct platform_device *bf7_drm_pdev;
++
++static int __init bf7_drm_module_init(void)
++{
++	int ret;
++
++	/*
++	 * Узла в device tree у нас нет и быть не может: дисплей описан по
++	 * старой вендорской схеме. Заводим устройство сами.
++	 */
++	bf7_drm_pdev = platform_device_register_simple("bf7-disp", -1, NULL, 0);
++	if (IS_ERR(bf7_drm_pdev))
++		return PTR_ERR(bf7_drm_pdev);
++
++	ret = platform_driver_register(&bf7_drm_platform_driver);
++	if (ret)
++		platform_device_unregister(bf7_drm_pdev);
++
++	return ret;
++}
++
++static void __exit bf7_drm_module_exit(void)
++{
++	platform_driver_unregister(&bf7_drm_platform_driver);
++	platform_device_unregister(bf7_drm_pdev);
++}
++
++/*
++ * Позже обычного: к этому моменту вендорский primary_display должен быть уже
++ * инициализирован, иначе размеры панели неизвестны.
++ */
++late_initcall(bf7_drm_module_init);
++module_exit(bf7_drm_module_exit);
++
++MODULE_DESCRIPTION("BF7 minimal KMS on top of MediaTek primary_display");
++MODULE_LICENSE("GPL v2");
+-- 
+2.55.0
+

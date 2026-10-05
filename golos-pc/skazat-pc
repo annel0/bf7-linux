@@ -1,0 +1,13 @@
+#!/bin/sh
+# Сказать в идущий на BF7 разговор голосом Piper, синтез на ПК.
+#   skazat-pc "текст"
+set -eu
+G=$(cd "$(dirname "$0")" && pwd)
+[ $# -ge 1 ] || { echo "вызов: skazat-pc \"текст\"" >&2; exit 2; }
+wav=$(mktemp /tmp/skazat-pc.XXXXXX.wav)
+raw=${wav%.wav}.raw
+printf '%s\n' "$*" | "$G/piper/piper" --model "$G/ru_RU-dmitri-medium.onnx" --output_file "$wav" 2>/dev/null
+ffmpeg -hide_banner -loglevel error -y -i "$wav" -ar 48000 -ac 2 -f s16le "$raw"
+scp -q "$raw" bf7:/run/bf7-skazat.raw
+ssh bf7 'echo "igraj /run/bf7-skazat.raw" > /run/bf7-rech.cmd'
+rm -f "$wav" "$raw"

@@ -1,0 +1,14 @@
+[Desktop Entry]
+# BF7: «Фото» — просмотр снимков (eog) сразу с папкой «Изображения».
+# Сам eog в сетке не виден (не помечен мобильным) и без файла открывается
+# пустым; в узком окне умещается — проверено камерой 2026-09-30.
+Type=Application
+Name=Фото
+Name[en]=Photos
+Comment=Снимки камеры и экрана
+Exec=/usr/local/bin/bf7-foto
+Icon=org.gnome.eog
+Terminal=false
+Categories=Graphics;Viewer;
+StartupNotify=true
+X-Purism-FormFactor=Workstation;Mobile;

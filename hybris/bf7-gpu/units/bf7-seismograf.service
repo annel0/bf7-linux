@@ -1,0 +1,16 @@
+[Unit]
+# BF7: сейсмограф — раз в секунду пишет тряску по акселерометру в
+# /var/lib/bf7-seismograf/ГГГГ-ММ-ДД.csv. Ест мало: 5 чтений I2C в секунду.
+# Пока телефон спит (на батарее через 10 мин простоя), записи нет; на
+# зарядке телефон не засыпает, и ночь пишется целиком.
+Description=Сейсмограф BF7 (акселерометр sc7a20)
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/bf7-seismograf
+Restart=on-failure
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

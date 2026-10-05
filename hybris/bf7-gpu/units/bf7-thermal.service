@@ -1,0 +1,31 @@
+[Unit]
+# BF7: заводская политика температуры MediaTek.
+#
+# На Android её при загрузке однократно прописывает thermal_manager из
+# /vendor: расшифровывает /vendor/etc/.tp/thermal.conf и пишет команды в
+# /proc/driver/thermal/*. Без него (так было до 2026-09-23) ядро жило на
+# начальных настройках:
+#   - зона процессора опрашивалась каждые 40 мс (TZCPU_INITCFG_INTERVAL) —
+#     ~23 пробуждения в секунду круглосуточно; по политике — 200 мс;
+#   - у датчика платы (mtktsAP) не было НИ ОДНОГО порога: ни ограничения
+#     тока заряда при 45–47 °C, ни выключения при 90–100 °C; у батареи — ни
+#     аварийного выключения при 60 °C.
+# Что именно пишется, снято strace в песочнице (unshare + подменный
+# /proc/driver/thermal) до первого настоящего запуска — см. дев-лог.
+# Цена: при долгой тяжёлой нагрузке процессор притормаживает с 54 °C, как на
+# заводской прошивке.
+Description=Политика температуры MediaTek (thermal_manager из /vendor)
+After=bf7-android-mounts.service
+Requires=bf7-android-mounts.service
+ConditionPathExists=/vendor/bin/thermal_manager
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Сюда он пишет свою памятку; без каталога выходит с кодом 255.
+ExecStartPre=/bin/mkdir -p /data/vendor/.tp
+ExecStart=/vendor/bin/thermal_manager
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

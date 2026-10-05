@@ -1,0 +1,56 @@
+--- a/src/lockscreen.c	2026-09-30 17:11:11.561984990 +0300
++++ b/src/lockscreen.c	2026-09-30 17:11:11.613953028 +0300
+@@ -101,6 +101,8 @@
+   GtkWidget         *btn_emergency;
+   guint              idle_timer;
+   gint64             last_input;
++  /* BF7: возврат со страницы плагинов на часы */
++  guint              widget_timer;
+   PhoshAuth         *auth;
+   GSettings         *keypad_settings;
+ 
+@@ -598,6 +600,17 @@
+ }
+ 
+ 
++static gboolean
++bf7_back_to_info (PhoshLockscreen *self)
++{
++  PhoshLockscreenPrivate *priv = phosh_lockscreen_get_instance_private (self);
++
++  priv->widget_timer = 0;
++  hdy_deck_set_visible_child (priv->deck, priv->carousel);
++  return G_SOURCE_REMOVE;
++}
++
++
+ static void
+ on_deck_visible_child_changed (PhoshLockscreen *self, GParamSpec *pspec, HdyDeck *deck)
+ {
+@@ -625,6 +638,18 @@
+ 
+   hdy_deck_set_can_swipe_forward(deck, swipe_forward);
+   hdy_deck_set_can_swipe_back (deck, swipe_back);
++
++  /*
++   * BF7: страница плагинов (левее часов) не возвращается сама: ни по
++   * простою, ни при гашении экрана. Оставленная там, она встречала при
++   * следующем включении — и будильник звонил поверх списка событий вместо
++   * часов. Как с клавиатурой PIN (keypad_check_idle), только мягче: 30 с.
++   */
++  g_clear_handle_id (&priv->widget_timer, g_source_remove);
++  if (visible_child != priv->carousel && visible_child != GTK_WIDGET (priv->box_call_display)) {
++    priv->widget_timer = g_timeout_add_seconds (30, (GSourceFunc) bf7_back_to_info, self);
++    g_source_set_name_by_id (priv->widget_timer, "[phosh] bf7 lockscreen widget back");
++  }
+ }
+ 
+ 
+@@ -805,6 +830,7 @@
+   g_clear_object (&priv->settings);
+   g_clear_object (&priv->wall_clock);
+   g_clear_handle_id (&priv->idle_timer, g_source_remove);
++  g_clear_handle_id (&priv->widget_timer, g_source_remove);
+   g_clear_object (&priv->calls_manager);
+   g_clear_pointer (&priv->active, g_free);
+   g_clear_object (&priv->keypad_settings);

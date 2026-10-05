@@ -1,0 +1,14 @@
+[Unit]
+# BF7: записать время из NTP в аппаратные часы (RTC PMIC mt6397).
+#
+# В ядре нет CONFIG_RTC_SYSTOHC, и timesyncd в RTC не пишет: 2026-09-30 RTC
+# отставал на 4,5 мин. Будильнику во сне это не мешает (alarmtimer заводит
+# RTC относительным интервалом), но загрузка без сети начиналась бы с
+# неверного времени — а к нему привязаны EPO для GPS, TLS и журналы.
+# Пишем только при синхронизированном времени, иначе испортили бы RTC.
+Description=BF7: время из NTP в RTC
+
+[Service]
+Type=oneshot
+ExecCondition=/bin/sh -c '[ "$(timedatectl show -p NTPSynchronized --value)" = yes ]'
+ExecStart=/usr/sbin/hwclock --systohc --utc

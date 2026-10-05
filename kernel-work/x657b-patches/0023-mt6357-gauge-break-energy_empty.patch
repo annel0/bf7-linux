@@ -1,0 +1,48 @@
+From 02f601b7dc70a28d8cc749d479ff7617db78d5f1 Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 12:04:31 +0300
+Subject: [PATCH 23/40] =?UTF-8?q?mt6357-gauge:=20=D0=BF=D1=80=D0=BE=D0=BF?=
+ =?UTF-8?q?=D1=83=D1=89=D0=B5=D0=BD=D0=BD=D1=8B=D0=B9=20break=20=D0=B2=20e?=
+ =?UTF-8?q?nergy=5Fempty?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Чтение POWER_SUPPLY_PROP_ENERGY_EMPTY проваливалось в default и всегда
+давало -EINVAL: признак выключения по DLPT не доходил до читателя, а ядро
+на каждом событии батареи писало «driver failed to report energy_empty»
+(20 раз за загрузку). В соседней копии mt6359-gauge.c break на месте.
+После: читается 0, ошибок нет. (aed-main.c — поправлено имя параметра в
+комментарии: aee_aed.utc_sync_ms.)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/power/supply/mt6357-gauge.c | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/power/supply/mt6357-gauge.c b/drivers/power/supply/mt6357-gauge.c
+index e4bad8cf3..dcffc72f0 100644
+--- a/drivers/power/supply/mt6357-gauge.c
++++ b/drivers/power/supply/mt6357-gauge.c
+@@ -1553,9 +1553,15 @@ static int psy_gauge_get_property(struct power_supply *psy,
+ 		break;
+ 	case POWER_SUPPLY_PROP_ENERGY_EMPTY:
+ 		gm = gauge->gm;
+-		if (gm != NULL)
+-			val->intval = gm->sdc.shutdown_status.is_dlpt_shutdown;
+-
++		/*
++		 * BF7: здесь не было break — чтение проваливалось в default и
++		 * всегда давало -EINVAL: признак выключения по DLPT никто не
++		 * получал, а ядро на каждом событии батареи писало «driver failed
++		 * to report energy_empty». В mt6359-gauge.c break на месте.
++		 */
++		val->intval = gm != NULL ?
++			gm->sdc.shutdown_status.is_dlpt_shutdown : 0;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+-- 
+2.55.0
+

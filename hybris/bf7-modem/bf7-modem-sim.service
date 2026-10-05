@@ -1,0 +1,16 @@
+[Unit]
+# BF7: перевести модем в CFUN=4 до ModemManager (см. bf7-modem-sim.py).
+Description=Модем: включить SIM до ModemManager
+After=bf7-modem-at.service
+Requires=bf7-modem-at.service
+Before=ModemManager.service
+PartOf=bf7-modem-at.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/bf7-modem-sim
+TimeoutStartSec=240
+
+[Install]
+WantedBy=multi-user.target

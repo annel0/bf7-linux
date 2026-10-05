@@ -1,0 +1,25 @@
+[Unit]
+Description=Топливомер батареи MediaTek
+Documentation=man:systemd.service(5)
+After=bf7-android-mounts.service
+Requires=bf7-android-mounts.service
+Before=upower.service
+ConditionPathExists=/vendor/bin/fuelgauged
+
+[Service]
+# Алгоритм заряда у MediaTek живёт не в ядре, а в этом демоне: без него
+# /sys/class/power_supply/battery/capacity остаётся -1, init_done = 0, и
+# upower не стартует. Демон обычный андроидный ELF, но из зависимостей у него
+# только libcutils/libutils/liblog/libc++/libc — libhybris не нужен.
+Type=simple
+ExecStart=/vendor/bin/fuelgauged
+Restart=always
+RestartSec=10
+# stdout у fuelgauged — сплошная отладка обмена с ядром («receiving 2 0 0 …»,
+# «fg send 3 4 0 0»): около 70 строк в минуту, главный источник шума в
+# журнале (замер 2026-09-23). Ошибки он пишет в stderr — их оставляем.
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

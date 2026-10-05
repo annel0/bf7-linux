@@ -1,0 +1,26 @@
+#!/bin/sh
+# Печатает каждое новое SMS из базы «Чатов» на BF7 (опрос раз в 10 с) — для Клауда: хозяин пишет SMS, когда не у компьютера.
+last=$(ssh -o ConnectTimeout=5 bf7 'python3 -c "import sqlite3;print(sqlite3.connect(\"/root/.purple/chatty/db/chatty-history.db\").execute(\"select max(id) from messages\").fetchone()[0] or 0)"' 2>/dev/null)
+[ -n "$last" ] || last=0
+while true; do
+	out=$(ssh -o ConnectTimeout=5 bf7 "python3 - $last" <<'PY' 2>/dev/null
+import sqlite3, sys, datetime, re
+try:
+    hozyain = re.sub(r"\D", "", open("/etc/bf7/hozyain-nomer").read())[-10:]
+except OSError:
+    hozyain = None
+db = sqlite3.connect("/root/.purple/chatty/db/chatty-history.db")
+q = "select m.id, m.time, m.direction, m.body, u.username from messages m left join users u on u.id = m.sender_id where m.id > ? order by m.id"
+for i, t, d, b, u in db.execute(q, (int(sys.argv[1]),)):
+    ts = datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S") if t else "?"
+    kto = "хозяина" if hozyain and re.sub(r"\D", "", u or "").endswith(hozyain) else "другого номера"
+    vid = ("SMS от " + kto) if d == 1 else "исходящее"
+    print("%d\t%s %s: %s" % (i, ts, vid, (b or "").replace("\n", " / ")))
+PY
+)
+	if [ -n "$out" ]; then
+		printf "%s\n" "$out" | cut -f2-
+		last=$(printf "%s\n" "$out" | tail -1 | cut -f1)
+	fi
+	sleep 10
+done

@@ -1,0 +1,89 @@
+From 0e4ede387f0c1a2d3fc0c86b2a8cc517d2d557fc Mon Sep 17 00:00:00 2001
+From: bf7-port <bf7@local>
+Date: Wed, 23 Sep 2026 15:07:56 +0300
+Subject: [PATCH 27/40] =?UTF-8?q?=D0=9C=D0=BE=D0=B4=D0=B5=D0=BC=20=D0=B1?=
+ =?UTF-8?q?=D1=83=D0=B4=D0=B8=D1=82=20=D1=81=D0=BF=D1=8F=D1=89=D0=B8=D0=B9?=
+ =?UTF-8?q?=20=D1=82=D0=B5=D0=BB=D0=B5=D1=84=D0=BE=D0=BD:=20CCIF=20=D0=BA?=
+ =?UTF-8?q?=D0=B0=D0=BA=20=D0=B8=D1=81=D1=82=D0=BE=D1=87=D0=BD=D0=B8=D0=BA?=
+ =?UTF-8?q?=20=D0=BF=D1=80=D0=BE=D0=B1=D1=83=D0=B6=D0=B4=D0=B5=D0=BD=D0=B8?=
+ =?UTF-8?q?=D1=8F=20s2idle?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ccci_hif_ccif звал irq_set_irq_wake только при MD_GENERATION >= 6297; на
+MT6761 Android спит в deep, и модем будит его маской SPM, а у нас сон
+s2idle — будят лишь помеченные прерывания. Теперь вызов безусловный.
+У mtk_sysirq_chip не было IRQCHIP_SKIP_SET_WAKE, и irq_set_irq_wake на
+любой линии MT_SYSIRQ отвечал ENXIO (пробуждение ведёт родитель GIC).
+Флаг глобальный: будить теперь могут все, кто просил (CCIF 37/46, BTIF
+80; Wi-Fi и журнал связи сняты в модулях — оверлей связности).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/irqchip/irq-mtk-sysirq.c                |  7 +++++++
+ drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c | 12 ++++++++----
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/irqchip/irq-mtk-sysirq.c b/drivers/irqchip/irq-mtk-sysirq.c
+index 42455f31b..af6f4fb14 100644
+--- a/drivers/irqchip/irq-mtk-sysirq.c
++++ b/drivers/irqchip/irq-mtk-sysirq.c
+@@ -73,6 +73,13 @@ static struct irq_chip mtk_sysirq_chip = {
+ 	.irq_set_type		= mtk_sysirq_set_type,
+ 	.irq_retrigger		= irq_chip_retrigger_hierarchy,
+ 	.irq_set_affinity	= irq_chip_set_affinity_parent,
++	/*
++	 * BF7: пробуждение ведёт родитель (GIC сам помечен SKIP_SET_WAKE), а
++	 * без этого флага irq_set_irq_wake на любой линии MT_SYSIRQ отвечал
++	 * ENXIO. Нужно модему: в сне s2idle его прерывание CCIF должно будить,
++	 * иначе входящий звонок и SMS не доходят до спящего телефона.
++	 */
++	.flags			= IRQCHIP_SKIP_SET_WAKE,
+ };
+ 
+ static int mtk_sysirq_domain_translate(struct irq_domain *d,
+diff --git a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+index 5f58ee189..4891c6eff 100644
+--- a/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
++++ b/drivers/misc/mediatek/eccci/hif/ccci_hif_ccif.c
+@@ -1891,13 +1891,18 @@ static int ccif_late_init(unsigned char hif_id)
+ 			ccif_ctrl->ap_ccif_irq1_id, ret);
+ 		return -1;
+ 	}
+-#if (MD_GENERATION >= 6297)
++	/*
++	 * BF7: будить процессор и на младших поколениях модема. На Android с
++	 * MT6761 сон — это deep через SPM, и модем будит его аппаратной маской
++	 * SPM; у нас сон s2idle (freeze), а в нём будят только прерывания,
++	 * помеченные как wake. Без этого входящий звонок или SMS не будили
++	 * спящий телефон.
++	 */
+ 	ret = irq_set_irq_wake(ccif_ctrl->ap_ccif_irq1_id, 1);
+ 	if (ret)
+ 		CCCI_ERROR_LOG(ccif_ctrl->md_id, TAG,
+ 			"irq_set_irq_wake ccif ap_ccif_irq1_id(%d) error %d\n",
+ 			ccif_ctrl->ap_ccif_irq1_id, ret);
+-#endif
+ 	/*need compare k5.10*/
+ 	md_ccif_ring_buf_init(CCIF_HIF_ID);
+ 	return 0;
+@@ -2283,14 +2288,13 @@ static int ccif_hif_hw_init(struct device *dev, struct md_ccif_ctrl *md_ctrl)
+ 			md_ctrl->ap_ccif_irq0_id, ret);
+ 		return -1;
+ 	}
+-#if (MD_GENERATION >= 6297)
++	/* BF7: будить и на младших поколениях — см. выше, у irq1. */
+ 	ret = irq_set_irq_wake(md_ctrl->ap_ccif_irq0_id, 1);
+ 	if (ret){
+ 		CCCI_ERROR_LOG(md_ctrl->md_id, TAG,
+ 				"irq_set_irq_wake ccif irq0(%d) error %d\n",
+ 				md_ctrl->ap_ccif_irq0_id, ret);
+ 	}
+-#endif
+ 	return 0;
+ 
+ }
+-- 
+2.55.0
+

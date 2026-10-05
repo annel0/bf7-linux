@@ -1,0 +1,13 @@
+Index: phosh-pkg/src/ui/settings.ui
+===================================================================
+--- phosh-pkg.orig/src/ui/settings.ui	2023-02-01 21:36:08.000000000 +0300
++++ phosh-pkg/src/ui/settings.ui	2026-09-25 12:22:19.637747916 +0300
+@@ -331,7 +331,7 @@
+                                 <property name="visible">True</property>
+                                 <property name="halign">start</property>
+                                 <property name="hexpand">True</property>
+-                                <property name="label">Notifications</property>
++                                <property name="label" translatable="yes">Notifications</property>
+                                 <attributes>
+                                   <attribute name="weight" value="bold"/>
+                                 </attributes>
